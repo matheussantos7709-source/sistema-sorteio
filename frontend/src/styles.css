@@ -1,0 +1,226 @@
+:root {
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  color: #111827;
+  background: #0b1220;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: radial-gradient(1200px 600px at 30% 0%, rgba(99,102,241,0.16), transparent 60%),
+              radial-gradient(900px 500px at 85% 10%, rgba(16,185,129,0.12), transparent 60%),
+              #0b1220;
+}
+
+.container {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 18px;
+}
+
+.header {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom: 14px;
+}
+
+.title {
+  font-size: 20px;
+  font-weight: 800;
+  color: #e5e7eb;
+}
+
+.sub {
+  color: #9ca3af;
+  font-size: 13px;
+  margin-top: 2px;
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  gap: 14px;
+  min-height: calc(100vh - 90px);
+}
+
+.card {
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 14px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+}
+
+.cardHeader {
+  padding: 12px 12px 0 12px;
+  color: #e5e7eb;
+  font-weight: 700;
+}
+
+.cardBody { padding: 12px; }
+
+.tabs {
+  display:flex;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.10);
+}
+
+.tab {
+  border: 1px solid rgba(255,255,255,0.14);
+  background: rgba(255,255,255,0.06);
+  color: #e5e7eb;
+  padding: 8px 10px;
+  border-radius: 10px;
+  cursor:pointer;
+  font-weight: 650;
+  font-size: 13px;
+}
+
+.tab.active {
+  background: rgba(99,102,241,0.20);
+  border-color: rgba(99,102,241,0.35);
+}
+
+.fieldGrid {
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.field { display:flex; flex-direction:column; gap: 6px; }
+
+label { color:#cbd5e1; font-size: 12px; }
+
+input, select {
+  width: 100%;
+  padding: 10px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,0.14);
+  background: rgba(15,23,42,0.70);
+  color: #e5e7eb;
+  outline: none;
+}
+
+input::placeholder { color: rgba(226,232,240,0.45); }
+
+.actionsRow {
+  display:flex;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+button {
+  border: 1px solid rgba(255,255,255,0.14);
+  background: rgba(255,255,255,0.06);
+  color: #e5e7eb;
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+button.primary {
+  background: rgba(16,185,129,0.18);
+  border-color: rgba(16,185,129,0.35);
+}
+
+button.danger {
+  background: rgba(239,68,68,0.16);
+  border-color: rgba(239,68,68,0.35);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.tableWrap {
+  overflow: auto;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.10);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 720px;
+}
+
+th, td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  color:#e5e7eb;
+  font-size: 13px;
+}
+
+th { color:#cbd5e1; font-weight: 800; }
+
+tr.row {
+  cursor: pointer;
+}
+tr.row:hover {
+  background: rgba(255,255,255,0.05);
+}
+tr.selected {
+  background: rgba(99,102,241,0.18);
+}
+
+.badge {
+  display:inline-block;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  border: 1px solid rgba(255,255,255,0.14);
+}
+.badge.inscrito { background: rgba(59,130,246,0.16); }
+.badge.selecionado { background: rgba(245,158,11,0.16); }
+.badge.confirmado { background: rgba(16,185,129,0.16); }
+.badge.suplente { background: rgba(168,85,247,0.16); }
+.badge.outro { background: rgba(148,163,184,0.12); }
+
+.toast {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.12);
+  color: #e5e7eb;
+}
+
+.toast.ok { background: rgba(16,185,129,0.12); border-color: rgba(16,185,129,0.25); }
+.toast.err { background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.25); }
+
+/* modal */
+.modalOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding: 18px;
+}
+.modal {
+  width: min(760px, 100%);
+  background: rgba(15,23,42,0.92);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 14px;
+  box-shadow: 0 15px 45px rgba(0,0,0,0.45);
+}
+.modalHeader {
+  padding: 12px 12px 0 12px;
+  color:#e5e7eb;
+  font-weight: 900;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+.modalBody { padding: 12px; }
+.small {
+  color:#9ca3af;
+  font-size: 12px;
+}
