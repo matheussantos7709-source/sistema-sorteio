@@ -37,7 +37,11 @@ print("DB em uso:", caminho_db())
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-    "http://127.0.0.1:5173","http://localhost:5173","https://sistema-sorteio-1.onrender.com"],
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "https://sistema-sorteio-1.onrender.com",   # seu FRONT (static site)
+        "https://sistema-sorteio.onrender.com",     # (opcional)
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
