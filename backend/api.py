@@ -4,14 +4,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
-from pathlib import Path
 from io import BytesIO
 import io
 import csv
 import random
 
-from openpyxl import load_workbook, Workbook
+from openpyxl import Workbook
 
+# imports do seu projeto (monorepo)
 from backend.database import criar_tabela, conectar, registrar_vencedor, caminho_db
 from backend.services import (
     cadastrar_participante,
@@ -19,6 +19,7 @@ from backend.services import (
     promover_suplente_se_expirou,
     listar_historico,
     limpar_historico,
+    importar_participantes_xlsx,
 )
 
 app = FastAPI(title="Sistema de Sorteio API", version="1.0.0")
@@ -28,13 +29,15 @@ print("DB em uso:", caminho_db())
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # depois você pode restringir pro domínio do frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------- MODELOS ----------------
+# ---------------------------
+# MODELOS
+# ---------------------------
 
 class ParticipanteIn(BaseModel):
     nome: str
@@ -45,8 +48,31 @@ class ParticipanteIn(BaseModel):
     perfil: Optional[str] = None
     semestre: Optional[str] = None
 
+class SorteioIn(BaseModel):
+    vagas: int
+    suplentes: int
 
-# ---------------- PARTICIPANTES ----------------
+class ConfirmarIn(BaseModel):
+    email: str
+
+class PromoverIn(BaseModel):
+    prazo_horas: int = 48
+
+# ---------------------------
+# ROTAS BÁSICAS
+# ---------------------------
+
+@app.get("/")
+def home():
+    return {"ok": True, "msg": "API no ar. Acesse /docs"}
+
+@app.get("/api/dbinfo")
+def dbinfo():
+    return {"db_path": caminho_db()}
+
+# ---------------------------
+# PARTICIPANTES
+# ---------------------------
 
 @app.get("/api/participantes")
 def listar_participantes():
@@ -57,117 +83,311 @@ def listar_participantes():
     conn.close()
     return [dict(r) for r in rows]
 
-
 @app.post("/api/participantes")
-def criar_participante(p: ParticipanteIn):
-    cadastrar_participante(
-        p.nome.strip(),
-        (p.email or "").strip(),
-        (p.cpf or "").strip(),
-        (p.whatsapp or "").strip(),
-        (p.curso or "").strip(),
-        (p.perfil or "").strip(),
-        (p.semestre or "").strip(),
-    )
-    return {"ok": True}
+def criar_ou_atualizar_participante(p: ParticipanteIn):
+    if not (p.nome or "").strip():
+        raise HTTPException(status_code=400, detail="Nome é obrigatório.")
+    try:
+        cadastrar_participante(
+            (p.nome or "").strip(),
+            (p.email or "").strip(),
+            (p.cpf or "").strip(),
+            (p.whatsapp or "").strip(),
+            (p.curso or "").strip(),
+            (p.perfil or "").strip(),
+            (p.semestre or "").strip(),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "msg": "Participante salvo com sucesso."}
 
+@app.delete("/api/participantes")
+def deletar_todos_participantes(
+    apagar_historico: bool = Query(False),
+    reset_ids: bool = Query(True),
+):
+    conn = conectar()
+    cur = conn.cursor()
 
-# ---------------- IMPORTAÇÃO ----------------
+    cur.execute("SELECT COUNT(*) FROM participantes")
+    total_part = cur.fetchone()[0]
+
+    total_hist = 0
+    if apagar_historico:
+        cur.execute("SELECT COUNT(*) FROM historico_sorteios")
+        total_hist = cur.fetchone()[0]
+        cur.execute("DELETE FROM historico_sorteios")
+        if reset_ids:
+            cur.execute("DELETE FROM sqlite_sequence WHERE name='historico_sorteios'")
+
+    cur.execute("DELETE FROM participantes")
+    if reset_ids:
+        cur.execute("DELETE FROM sqlite_sequence WHERE name='participantes'")
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "msg": "Limpeza concluída.",
+        "participantes_removidos": total_part,
+        "historico_removidos": total_hist if apagar_historico else 0,
+        "reset_ids": reset_ids,
+    }
+
+@app.delete("/api/participantes/{pid}")
+def deletar_participante(pid: int):
+    conn = conectar()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM participantes WHERE id=?", (pid,))
+    apagados = cur.rowcount
+    conn.commit()
+    conn.close()
+    if apagados == 0:
+        raise HTTPException(status_code=404, detail="Participante não encontrado.")
+    return {"ok": True, "msg": "Participante removido."}
+
+# ---------------------------
+# SORTEIO / CONFIRMAÇÃO / PROMOÇÃO
+# ---------------------------
+
+@app.post("/api/sortear")
+def sortear(payload: SorteioIn):
+    vagas = int(payload.vagas)
+    suplentes_qtd = int(payload.suplentes)
+
+    if vagas <= 0:
+        raise HTTPException(status_code=400, detail="Vagas deve ser > 0.")
+    if suplentes_qtd < 0:
+        raise HTTPException(status_code=400, detail="Suplentes deve ser >= 0.")
+
+    conn = conectar()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, nome, email
+        FROM participantes
+        WHERE status='INSCRITO'
+          AND bloqueado=0
+    """)
+    participantes = cur.fetchall()
+
+    if len(participantes) < (vagas + suplentes_qtd):
+        conn.close()
+        raise HTTPException(status_code=400, detail="Participantes insuficientes.")
+
+    random.shuffle(participantes)
+
+    vencedores = participantes[:vagas]
+    suplentes = participantes[vagas:vagas + suplentes_qtd]
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # vencedores
+    for idx, p in enumerate(vencedores, start=1):
+        pid = p["id"]
+        nome = p["nome"]
+        email = p["email"]
+
+        registrar_vencedor(pid, nome, email, conn=conn)
+        cur.execute("""
+            UPDATE participantes
+            SET status='SELECIONADO',
+                bloqueado=1,
+                confirmado=0,
+                data_sorteio=?,
+                prioridade=?
+            WHERE id=?
+        """, (agora, idx, pid))
+
+    # suplentes
+    for idx, s in enumerate(suplentes, start=vagas + 1):
+        pid = s["id"]
+        cur.execute("""
+            UPDATE participantes
+            SET status='SUPLENTE',
+                confirmado=0,
+                data_sorteio=?,
+                prioridade=?
+            WHERE id=?
+        """, (agora, idx, pid))
+
+    conn.commit()
+    conn.close()
+    return {"ok": True, "msg": "Sorteio realizado."}
+
+@app.post("/api/confirmar")
+def confirmar(payload: ConfirmarIn):
+    email = (payload.email or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email é obrigatório.")
+    alterados = confirmar_presenca_por_email(email)
+    return {"ok": alterados > 0, "alterados": alterados}
+
+@app.post("/api/promover")
+def promover(payload: PromoverIn):
+    prazo = int(payload.prazo_horas)
+    ok, msg = promover_suplente_se_expirou(prazo)
+    return {"ok": ok, "msg": msg}
+
+# ---------------------------
+# HISTÓRICO
+# ---------------------------
+
+@app.get("/api/historico")
+def historico():
+    dados = listar_historico()
+    return [{"data_sorteio": d, "nome": n, "email": e, "status_atual": s} for (d, n, e, s) in dados]
+
+@app.delete("/api/historico")
+def apagar_historico(reset_id: bool = True):
+    apagados = limpar_historico(reset_id=reset_id)
+    return {"ok": True, "apagados": apagados}
+
+# ---------------------------
+# IMPORTAÇÃO
+# ---------------------------
 
 @app.post("/api/importar-csv")
 async def importar_csv(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".csv"):
-        raise HTTPException(400, "Envie um CSV")
+        raise HTTPException(status_code=400, detail="Envie um arquivo .csv")
 
     content = await file.read()
-    text = content.decode("utf-8-sig")
+
+    # tenta decodificar com fallback
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = content.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise HTTPException(status_code=400, detail="Não foi possível ler o CSV (encoding inválido).")
 
     reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="CSV sem cabeçalho (colunas).")
 
     importados = 0
     ignorados = 0
+    erros = 0
 
     for row in reader:
         try:
-            nome = row.get("nome", "").strip()
+            nome = (row.get("nome") or "").strip()
             if not nome:
                 ignorados += 1
                 continue
 
             cadastrar_participante(
                 nome,
-                row.get("email", "").strip(),
-                row.get("cpf", "").strip(),
-                row.get("whatsapp", "").strip(),
-                row.get("curso", "").strip(),
-                row.get("perfil", "").strip(),
-                row.get("semestre", "").strip(),
+                (row.get("email") or "").strip(),
+                (row.get("cpf") or "").strip(),
+                (row.get("whatsapp") or "").strip(),
+                (row.get("curso") or "").strip(),
+                (row.get("perfil") or "").strip(),
+                (row.get("semestre") or "").strip(),
             )
             importados += 1
-        except:
-            ignorados += 1
+        except Exception:
+            erros += 1
 
-    return {"ok": True, "importados": importados, "ignorados": ignorados}
-
+    return {"ok": True, "msg": "Importação CSV concluída.", "importados": importados, "ignorados": ignorados, "erros": erros}
 
 @app.post("/api/importar-excel")
 async def importar_excel(file: UploadFile = File(...)):
+    # usa o seu services (mais robusto e com mapeamento por cabeçalho)
     if not file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(400, "Envie um XLSX")
+        raise HTTPException(status_code=400, detail="Envie um arquivo .xlsx")
 
     raw = await file.read()
-    wb = load_workbook(filename=io.BytesIO(raw))
-    ws = wb.active
+    result = importar_participantes_xlsx(raw)
 
-    importados = 0
-    ignorados = 0
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("msg", "Planilha inválida."))
 
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        try:
-            nome = str(row[0] or "").strip()
-            if not nome:
-                ignorados += 1
-                continue
+    # padroniza retorno pro frontend (pra não virar undefined)
+    erros_list = result.get("erros", []) or []
+    importados = int(result.get("importados", 0) or 0)
 
-            cadastrar_participante(
-                nome,
-                str(row[1] or "").strip(),
-                str(row[2] or "").strip(),
-                str(row[3] or "").strip(),
-                str(row[4] or "").strip(),
-                str(row[5] or "").strip(),
-                str(row[6] or "").strip(),
-            )
-            importados += 1
-        except:
-            ignorados += 1
+    return {
+        "ok": True,
+        "msg": result.get("msg", "Importação Excel concluída."),
+        "importados": importados,
+        "ignorados": 0,               # se quiser, você pode calcular depois
+        "erros": erros_list,
+        "erros_qtd": len(erros_list),
+    }
 
-    return {"ok": True, "importados": importados, "ignorados": ignorados}
+# ---------------------------
+# EXPORTAÇÃO
+# ---------------------------
 
-
-# ---------------- EXPORTAÇÃO ----------------
+def _xlsx_response(wb: Workbook, filename: str) -> StreamingResponse:
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 @app.get("/api/exportar-participantes")
 def exportar_participantes():
     conn = conectar()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM participantes ORDER BY id ASC")
+    cur.execute("""
+        SELECT id, nome, email, cpf, whatsapp, curso, perfil, status, bloqueado, semestre, confirmado, data_sorteio, prioridade
+        FROM participantes
+        ORDER BY id ASC
+    """)
     rows = cur.fetchall()
     conn.close()
 
     wb = Workbook()
     ws = wb.active
-    ws.append(rows[0].keys())
+    ws.title = "Participantes"
+    ws.append(["ID","Nome","Email","CPF","WhatsApp","Curso","Perfil","Status","Bloqueado","Semestre","Confirmado","Data Sorteio","Prioridade"])
 
     for r in rows:
-        ws.append(list(r))
+        ws.append([
+            r["id"], r["nome"], r["email"], r["cpf"], r["whatsapp"], r["curso"], r["perfil"],
+            r["status"], r["bloqueado"], r["semestre"], r["confirmado"], r["data_sorteio"], r["prioridade"]
+        ])
 
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
+    nome_arquivo = f"participantes_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    return _xlsx_response(wb, nome_arquivo)
 
-    return StreamingResponse(
-        bio,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="participantes.xlsx"'},
-    )
+@app.get("/api/exportar-resultados")
+def exportar_resultados():
+    conn = conectar()
+    cur = conn.cursor()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Resultado"
+
+    def add_section(titulo: str, status: str):
+        ws.append([titulo])
+        ws.append(["ID", "Nome", "Email", "CPF", "WhatsApp", "Curso", "Perfil", "Semestre", "Data Sorteio", "Prioridade"])
+        cur.execute("""
+            SELECT id, nome, email, cpf, whatsapp, curso, perfil, semestre, data_sorteio, prioridade
+            FROM participantes
+            WHERE status=?
+            ORDER BY prioridade ASC, id ASC
+        """, (status,))
+        for r in cur.fetchall():
+            ws.append([r["id"], r["nome"], r["email"], r["cpf"], r["whatsapp"], r["curso"], r["perfil"], r["semestre"], r["data_sorteio"], r["prioridade"]])
+        ws.append([])
+
+    add_section("CONFIRMADOS", "CONFIRMADO")
+    add_section("SELECIONADOS (aguardando confirmação)", "SELECIONADO")
+    add_section("SUPLENTES", "SUPLENTE")
+    add_section("INSCRITOS", "INSCRITO")
+
+    conn.close()
+
+    nome_arquivo = f"resultado_sorteio_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    return _xlsx_response(wb, nome_arquivo)
