@@ -8,11 +8,12 @@ from io import BytesIO
 import io
 import csv
 import random
+import os
 
 from openpyxl import Workbook
 
 # imports do seu projeto (monorepo)
-from backend.database import criar_tabela, conectar, registrar_vencedor, caminho_db
+from backend.database import criar_tabela, conectar, registrar_vencedor
 from backend.services import (
     cadastrar_participante,
     confirmar_presenca_por_email,
@@ -25,7 +26,7 @@ from backend.services import (
 app = FastAPI(title="Sistema de Sorteio API", version="1.0.0")
 
 criar_tabela()
-print("DB em uso:", caminho_db())
+print("DB: PostgreSQL via DATABASE_URL (Render)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,6 +35,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------
+# HELPERS
+# ---------------------------
+
+def rows_to_dicts(cur, rows):
+    """
+    Converte fetchall() em lista de dicts usando cur.description
+    (funciona com pg8000 / postgres)
+    """
+    cols = [c[0] for c in (cur.description or [])]
+    return [dict(zip(cols, r)) for r in rows]
+
+def fetchall_dict(cur):
+    return rows_to_dicts(cur, cur.fetchall())
 
 # ---------------------------
 # MODELOS
@@ -68,7 +84,11 @@ def home():
 
 @app.get("/api/dbinfo")
 def dbinfo():
-    return {"db_path": caminho_db()}
+    return {
+        "ok": True,
+        "db": "postgres",
+        "database_url_set": bool((os.getenv("DATABASE_URL") or "").strip()),
+    }
 
 # ---------------------------
 # PARTICIPANTES
@@ -79,9 +99,9 @@ def listar_participantes():
     conn = conectar()
     cur = conn.cursor()
     cur.execute("SELECT * FROM participantes ORDER BY id ASC")
-    rows = cur.fetchall()
+    data = fetchall_dict(cur)
     conn.close()
-    return rows
+    return data
 
 @app.post("/api/participantes")
 def criar_ou_atualizar_participante(p: ParticipanteIn):
@@ -110,19 +130,20 @@ def deletar_todos_participantes(
     cur = conn.cursor()
 
     cur.execute("SELECT COUNT(*) FROM participantes")
-    total_part = cur.fetchone()[0]
+    total_part = int(cur.fetchone()[0] or 0)
 
     total_hist = 0
     if apagar_historico:
         cur.execute("SELECT COUNT(*) FROM historico_sorteios")
-        total_hist = cur.fetchone()[0]
+        total_hist = int(cur.fetchone()[0] or 0)
         cur.execute("DELETE FROM historico_sorteios")
         if reset_ids:
-            cur.execute("DELETE FROM sqlite_sequence WHERE name='historico_sorteios'")
+            # Postgres: reseta a sequence do SERIAL/IDENTITY
+            cur.execute("SELECT setval(pg_get_serial_sequence('historico_sorteios','id'), 1, false)")
 
     cur.execute("DELETE FROM participantes")
     if reset_ids:
-        cur.execute("DELETE FROM sqlite_sequence WHERE name='participantes'")
+        cur.execute("SELECT setval(pg_get_serial_sequence('participantes','id'), 1, false)")
 
     conn.commit()
     conn.close()
@@ -139,7 +160,7 @@ def deletar_todos_participantes(
 def deletar_participante(pid: int):
     conn = conectar()
     cur = conn.cursor()
-    cur.execute("DELETE FROM participantes WHERE id=?", (pid,))
+    cur.execute("DELETE FROM participantes WHERE id=%s", (pid,))
     apagados = cur.rowcount
     conn.commit()
     conn.close()
@@ -168,9 +189,9 @@ def sortear(payload: SorteioIn):
         SELECT id, nome, email
         FROM participantes
         WHERE status='INSCRITO'
-          AND bloqueado=0
+          AND bloqueado=FALSE
     """)
-    participantes = cur.fetchall()
+    participantes = fetchall_dict(cur)
 
     if len(participantes) < (vagas + suplentes_qtd):
         conn.close()
@@ -180,23 +201,23 @@ def sortear(payload: SorteioIn):
 
     vencedores = participantes[:vagas]
     suplentes = participantes[vagas:vagas + suplentes_qtd]
-    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    agora = datetime.now()  # timestamp real no Postgres
 
     # vencedores
     for idx, p in enumerate(vencedores, start=1):
         pid = p["id"]
-        nome = p["nome"]
-        email = p["email"]
+        nome = p.get("nome") or ""
+        email = p.get("email") or ""
 
         registrar_vencedor(pid, nome, email, conn=conn)
         cur.execute("""
             UPDATE participantes
             SET status='SELECIONADO',
-                bloqueado=1,
-                confirmado=0,
-                data_sorteio=?,
-                prioridade=?
-            WHERE id=?
+                bloqueado=TRUE,
+                confirmado=FALSE,
+                data_sorteio=%s,
+                prioridade=%s
+            WHERE id=%s
         """, (agora, idx, pid))
 
     # suplentes
@@ -205,10 +226,10 @@ def sortear(payload: SorteioIn):
         cur.execute("""
             UPDATE participantes
             SET status='SUPLENTE',
-                confirmado=0,
-                data_sorteio=?,
-                prioridade=?
-            WHERE id=?
+                confirmado=FALSE,
+                data_sorteio=%s,
+                prioridade=%s
+            WHERE id=%s
         """, (agora, idx, pid))
 
     conn.commit()
@@ -297,7 +318,6 @@ async def importar_csv(file: UploadFile = File(...)):
 
 @app.post("/api/importar-excel")
 async def importar_excel(file: UploadFile = File(...)):
-    # usa o seu services (mais robusto e com mapeamento por cabeçalho)
     if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Envie um arquivo .xlsx")
 
@@ -307,7 +327,6 @@ async def importar_excel(file: UploadFile = File(...)):
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("msg", "Planilha inválida."))
 
-    # padroniza retorno pro frontend (pra não virar undefined)
     erros_list = result.get("erros", []) or []
     importados = int(result.get("importados", 0) or 0)
 
@@ -315,7 +334,7 @@ async def importar_excel(file: UploadFile = File(...)):
         "ok": True,
         "msg": result.get("msg", "Importação Excel concluída."),
         "importados": importados,
-        "ignorados": 0,               # se quiser, você pode calcular depois
+        "ignorados": 0,
         "erros": erros_list,
         "erros_qtd": len(erros_list),
     }
@@ -343,7 +362,7 @@ def exportar_participantes():
         FROM participantes
         ORDER BY id ASC
     """)
-    rows = cur.fetchall()
+    rows = fetchall_dict(cur)
     conn.close()
 
     wb = Workbook()
@@ -353,8 +372,8 @@ def exportar_participantes():
 
     for r in rows:
         ws.append([
-            r["id"], r["nome"], r["email"], r["cpf"], r["whatsapp"], r["curso"], r["perfil"],
-            r["status"], r["bloqueado"], r["semestre"], r["confirmado"], r["data_sorteio"], r["prioridade"]
+            r.get("id"), r.get("nome"), r.get("email"), r.get("cpf"), r.get("whatsapp"), r.get("curso"), r.get("perfil"),
+            r.get("status"), r.get("bloqueado"), r.get("semestre"), r.get("confirmado"), r.get("data_sorteio"), r.get("prioridade")
         ])
 
     nome_arquivo = f"participantes_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
@@ -375,11 +394,14 @@ def exportar_resultados():
         cur.execute("""
             SELECT id, nome, email, cpf, whatsapp, curso, perfil, semestre, data_sorteio, prioridade
             FROM participantes
-            WHERE status=?
+            WHERE status=%s
             ORDER BY prioridade ASC, id ASC
         """, (status,))
-        for r in cur.fetchall():
-            ws.append([r["id"], r["nome"], r["email"], r["cpf"], r["whatsapp"], r["curso"], r["perfil"], r["semestre"], r["data_sorteio"], r["prioridade"]])
+        for r in fetchall_dict(cur):
+            ws.append([
+                r.get("id"), r.get("nome"), r.get("email"), r.get("cpf"), r.get("whatsapp"),
+                r.get("curso"), r.get("perfil"), r.get("semestre"), r.get("data_sorteio"), r.get("prioridade")
+            ])
         ws.append([])
 
     add_section("CONFIRMADOS", "CONFIRMADO")
