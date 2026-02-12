@@ -81,7 +81,7 @@ def listar_participantes():
     cur.execute("SELECT * FROM participantes ORDER BY id ASC")
     rows = cur.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return rows
 
 @app.post("/api/participantes")
 def criar_ou_atualizar_participante(p: ParticipanteIn):

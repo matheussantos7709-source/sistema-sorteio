@@ -35,7 +35,7 @@ def cadastrar_participante(nome, email, cpf, whatsapp, curso, perfil, semestre):
 
     # procura por email/cpf SOMENTE se estiver preenchido
     if email:
-        cursor.execute("SELECT id FROM participantes WHERE email = ?", (email,))
+        cursor.execute("SELECT id FROM participantes WHERE email = %s", (email,))
         existe = cursor.fetchone()
 
     if not existe and cpf:

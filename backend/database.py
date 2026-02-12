@@ -1,93 +1,70 @@
-import sqlite3
-from datetime import datetime
-from pathlib import Path
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from urllib.parse import urlparse
 
-# caminho absoluto: sempre backend/sorteio.db
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "sorteio.db"
-
-
-def caminho_db() -> str:
-    """Retorna o caminho absoluto do banco (string)."""
-    return str(DB_PATH)
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 def conectar():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não definida.")
 
-    # espera o lock liberar ao invés de falhar na hora
-    conn.execute("PRAGMA busy_timeout = 30000;")  # 30s
-
-    # melhora concorrência de leitura/escrita
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA synchronous = NORMAL;")
-
-    return conn
-
-def _add_coluna_se_nao_existir(cursor, tabela: str, coluna_def: str):
-    try:
-        cursor.execute(f"ALTER TABLE {tabela} ADD COLUMN {coluna_def}")
-    except sqlite3.OperationalError:
-        # coluna já existe (ou alteração não permitida)
-        pass
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
 def criar_tabela():
-    conexao = conectar()
-    cursor = conexao.cursor()
+    conn = conectar()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS participantes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             nome TEXT NOT NULL,
             email TEXT UNIQUE,
             cpf TEXT UNIQUE,
             whatsapp TEXT,
             curso TEXT,
             perfil TEXT,
+            semestre TEXT,
             status TEXT DEFAULT 'INSCRITO',
-            bloqueado INTEGER DEFAULT 0,
-            semestre TEXT
-        )
+            confirmado BOOLEAN DEFAULT FALSE,
+            bloqueado BOOLEAN DEFAULT FALSE,
+            data_sorteio TIMESTAMP,
+            prioridade INTEGER
+        );
     """)
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS historico_sorteios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            participante_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            participante_id INTEGER REFERENCES participantes(id),
             nome TEXT,
             email TEXT,
-            data_sorteio TEXT
-        )
+            data_sorteio TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
 
-    # migrações seguras
-    _add_coluna_se_nao_existir(cursor, "participantes", "confirmado INTEGER DEFAULT 0")
-    _add_coluna_se_nao_existir(cursor, "participantes", "data_sorteio TEXT")
-    _add_coluna_se_nao_existir(cursor, "participantes", "prioridade INTEGER")
+    conn.commit()
+    conn.close()
 
-    conexao.commit()
-    conexao.close()
 
-def registrar_vencedor(id_participante, nome, email, conn=None):
-    """
-    Se conn for passado, usa a MESMA conexão (evita lock).
-    Se conn não for passado, abre/fecha uma conexão própria.
-    """
-    owns_conn = False
+def registrar_vencedor(participante_id, nome, email, conn=None):
+    close_conn = False
+
     if conn is None:
         conn = conectar()
-        owns_conn = True
+        close_conn = True
 
-    cursor = conn.cursor()
-    data = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO historico_sorteios (participante_id, nome, email)
+        VALUES (%s, %s, %s)
+    """, (participante_id, nome, email))
 
-    cursor.execute("""
-        INSERT INTO historico_sorteios (participante_id, nome, email, data_sorteio)
-        VALUES (?, ?, ?, ?)
-    """, (id_participante, nome, email, data))
-
-    if owns_conn:
+    if close_conn:
         conn.commit()
         conn.close()
+
+
+def caminho_db():
+    return DATABASE_URL
