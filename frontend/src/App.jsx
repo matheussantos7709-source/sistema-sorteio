@@ -1,3 +1,4 @@
+// frontend/src/App.jsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./styles.css";
 import { api } from "./api";
@@ -33,30 +34,12 @@ function Modal({ title, onClose, children }) {
   );
 }
 
-// --- helpers de upload e download ---
-async function uploadFile(url, file) {
-  const form = new FormData();
-  form.append("file", file);
-
-  const res = await fetch(url, { method: "POST", body: form });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || data.msg || "Falha ao importar.");
-  return data;
-}
-
-async function downloadFile(url, filenameFallback) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("Falha ao exportar.");
-
-  const blob = await res.blob();
-  const cd = res.headers.get("content-disposition") || "";
-  const match = /filename="([^"]+)"/i.exec(cd);
-  const filename = match?.[1] || filenameFallback;
-
+// --- helper de download ---
+async function downloadBlob(blob, filenameFallback) {
   const fileUrl = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = fileUrl;
-  a.download = filename;
+  a.download = filenameFallback;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -312,7 +295,6 @@ export default function App() {
     setLoading(true);
     try {
       const r = await api.promover({ prazo_horas: prazo });
-      // ok ou não, a msg é útil
       showOk(r.msg || (r.ok ? "Suplente promovido!" : "Nada para promover."));
       await carregarParticipantes();
     } catch (e) {
@@ -353,13 +335,13 @@ export default function App() {
     }
   }
 
-  // -------- IMPORTAÇÃO / EXPORTAÇÃO (NOVO) --------
+  // -------- IMPORTAÇÃO / EXPORTAÇÃO --------
   async function onImportarXlsx(file) {
     if (!file) return;
     setLoading(true);
     try {
-      const r = await uploadFile("/api/importar-excel", file);
-      showOk(`Importação concluída! Importados: ${r.importados} | Ignorados: ${r.ignorados}`);
+      const r = await api.importarExcel(file);
+      showOk(`Importação concluída! Importados: ${r.importados ?? 0} | Ignorados: ${r.ignorados ?? 0}`);
       await carregarParticipantes();
     } catch (e) {
       showErr(e);
@@ -373,9 +355,8 @@ export default function App() {
     if (!file) return;
     setLoading(true);
     try {
-      // precisa existir no backend: POST /api/importar-csv (UploadFile)
-      const r = await uploadFile("/api/importar-csv", file);
-      showOk(`Importação CSV ok! Importados: ${r.importados} | Ignorados: ${r.ignorados}`);
+      const r = await api.importarCsv(file);
+      showOk(`Importação CSV ok! Importados: ${r.importados ?? 0} | Ignorados: ${r.ignorados ?? 0}`);
       await carregarParticipantes();
     } catch (e) {
       showErr(e);
@@ -388,7 +369,8 @@ export default function App() {
   async function onExportarResultados() {
     setLoading(true);
     try {
-      await downloadFile("/api/exportar-resultados", "resultado_sorteio.xlsx");
+      const blob = await api.exportarResultados();
+      await downloadBlob(blob, "resultado_sorteio.xlsx");
       showOk("Download gerado!");
     } catch (e) {
       showErr(e);
@@ -400,7 +382,8 @@ export default function App() {
   async function onExportarParticipantes() {
     setLoading(true);
     try {
-      await downloadFile("/api/exportar-participantes", "participantes.xlsx");
+      const blob = await api.exportarParticipantes();
+      await downloadBlob(blob, "participantes.xlsx");
       showOk("Download gerado!");
     } catch (e) {
       showErr(e);
@@ -520,9 +503,6 @@ export default function App() {
                     onChange={(e) => onImportarCsv(e.target.files?.[0])}
                     disabled={loading}
                   />
-                  <div className="small" style={{ marginTop: 6, color: "#9ca3af" }}>
-                    Requer endpoint no backend: <b>POST /api/importar-csv</b>. Se não existir, vai dar erro (e eu te passo o patch).
-                  </div>
                 </div>
 
                 <div style={{ height: 12 }} />
@@ -717,10 +697,6 @@ export default function App() {
           <div className="actionsRow">
             <button className="primary" onClick={salvarEdicao} disabled={loading}>Salvar</button>
             <button onClick={() => { setEditOpen(false); setEditData(null); }}>Cancelar</button>
-          </div>
-
-          <div className="small" style={{ marginTop: 10 }}>
-            Obs: a API atualiza por email/cpf. Se você editar e deixar ambos vazios, pode virar registro novo dependendo do backend.
           </div>
         </Modal>
       )}
