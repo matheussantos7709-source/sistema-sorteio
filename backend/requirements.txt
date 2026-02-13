@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-openpyxl
-python-multipart
 pg8000
+python-multipart
+openpyxl
