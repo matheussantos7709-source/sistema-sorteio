@@ -84,11 +84,7 @@ def home():
 
 @app.get("/api/dbinfo")
 def dbinfo():
-    return {
-        "ok": True,
-        "db": "postgres",
-        "database_url_set": bool((os.getenv("DATABASE_URL") or "").strip()),
-    }
+    return {"assinatura": "POSTGRES_V2_2026-02-12"}
 
 # ---------------------------
 # PARTICIPANTES
