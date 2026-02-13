@@ -1,8 +1,9 @@
+# backend/api.py
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 from datetime import datetime
 from io import BytesIO
 import io
@@ -25,6 +26,7 @@ from backend.services import (
 
 app = FastAPI(title="Sistema de Sorteio API", version="1.0.0")
 
+# cria tabelas no start (Postgres)
 criar_tabela()
 print("DB: PostgreSQL via DATABASE_URL (Render)")
 
@@ -50,6 +52,27 @@ def rows_to_dicts(cur, rows):
 
 def fetchall_dict(cur):
     return rows_to_dicts(cur, cur.fetchall())
+
+def _mask_db_url(url: str) -> str:
+    """
+    Mascara senha do DATABASE_URL para não vazar em /dbinfo
+    Ex: postgresql://user:PASS@host/db -> postgresql://user:***@host/db
+    """
+    if not url:
+        return ""
+    try:
+        if "://" not in url:
+            return "***"
+        scheme, rest = url.split("://", 1)
+        if "@" not in rest:
+            return f"{scheme}://***"
+        creds, tail = rest.split("@", 1)
+        if ":" in creds:
+            user = creds.split(":", 1)[0]
+            return f"{scheme}://{user}:***@{tail}"
+        return f"{scheme}://***@{tail}"
+    except Exception:
+        return "***"
 
 # ---------------------------
 # MODELOS
@@ -83,8 +106,18 @@ def home():
     return {"ok": True, "msg": "API no ar. Acesse /docs"}
 
 @app.get("/api/dbinfo")
-def dbinfo():
-    return {"assinatura": "POSTGRES_V2_2026-02-12"}
+def dbinfo() -> Dict[str, Any]:
+    """
+    Endpoint pra você conferir SE está no Postgres e se o Render está com DATABASE_URL setada.
+    NÃO mostra senha.
+    """
+    db_url = (os.getenv("DATABASE_URL") or "").strip()
+    return {
+        "ok": True,
+        "assinatura": "POSTGRES_V2_2026-02-12",
+        "database_url_set": bool(db_url),
+        "database_url_masked": _mask_db_url(db_url) if db_url else "",
+    }
 
 # ---------------------------
 # PARTICIPANTES
@@ -93,11 +126,13 @@ def dbinfo():
 @app.get("/api/participantes")
 def listar_participantes():
     conn = conectar()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM participantes ORDER BY id ASC")
-    data = fetchall_dict(cur)
-    conn.close()
-    return data
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM participantes ORDER BY id ASC")
+        data = fetchall_dict(cur)
+        return data
+    finally:
+        conn.close()
 
 @app.post("/api/participantes")
 def criar_ou_atualizar_participante(p: ParticipanteIn):
@@ -123,46 +158,51 @@ def deletar_todos_participantes(
     reset_ids: bool = Query(True),
 ):
     conn = conectar()
-    cur = conn.cursor()
+    try:
+        cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(*) FROM participantes")
-    total_part = int(cur.fetchone()[0] or 0)
+        cur.execute("SELECT COUNT(*) FROM participantes")
+        total_part = int(cur.fetchone()[0] or 0)
 
-    total_hist = 0
-    if apagar_historico:
-        cur.execute("SELECT COUNT(*) FROM historico_sorteios")
-        total_hist = int(cur.fetchone()[0] or 0)
-        cur.execute("DELETE FROM historico_sorteios")
+        total_hist = 0
+        if apagar_historico:
+            cur.execute("SELECT COUNT(*) FROM historico_sorteios")
+            total_hist = int(cur.fetchone()[0] or 0)
+            cur.execute("DELETE FROM historico_sorteios")
+            if reset_ids:
+                cur.execute(
+                    "SELECT setval(pg_get_serial_sequence('historico_sorteios','id'), 1, false)"
+                )
+
+        cur.execute("DELETE FROM participantes")
         if reset_ids:
-            # Postgres: reseta a sequence do SERIAL/IDENTITY
-            cur.execute("SELECT setval(pg_get_serial_sequence('historico_sorteios','id'), 1, false)")
+            cur.execute("SELECT setval(pg_get_serial_sequence('participantes','id'), 1, false)")
 
-    cur.execute("DELETE FROM participantes")
-    if reset_ids:
-        cur.execute("SELECT setval(pg_get_serial_sequence('participantes','id'), 1, false)")
+        conn.commit()
 
-    conn.commit()
-    conn.close()
-
-    return {
-        "ok": True,
-        "msg": "Limpeza concluída.",
-        "participantes_removidos": total_part,
-        "historico_removidos": total_hist if apagar_historico else 0,
-        "reset_ids": reset_ids,
-    }
+        return {
+            "ok": True,
+            "msg": "Limpeza concluída.",
+            "participantes_removidos": total_part,
+            "historico_removidos": total_hist if apagar_historico else 0,
+            "reset_ids": reset_ids,
+        }
+    finally:
+        conn.close()
 
 @app.delete("/api/participantes/{pid}")
 def deletar_participante(pid: int):
     conn = conectar()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM participantes WHERE id=%s", (pid,))
-    apagados = cur.rowcount
-    conn.commit()
-    conn.close()
-    if apagados == 0:
-        raise HTTPException(status_code=404, detail="Participante não encontrado.")
-    return {"ok": True, "msg": "Participante removido."}
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM participantes WHERE id=%s", (pid,))
+        apagados = cur.rowcount
+        conn.commit()
+        if apagados == 0:
+            raise HTTPException(status_code=404, detail="Participante não encontrado.")
+        return {"ok": True, "msg": "Participante removido."}
+    finally:
+        conn.close()
 
 # ---------------------------
 # SORTEIO / CONFIRMAÇÃO / PROMOÇÃO
@@ -179,58 +219,67 @@ def sortear(payload: SorteioIn):
         raise HTTPException(status_code=400, detail="Suplentes deve ser >= 0.")
 
     conn = conectar()
-    cur = conn.cursor()
+    try:
+        cur = conn.cursor()
 
-    cur.execute("""
-        SELECT id, nome, email
-        FROM participantes
-        WHERE status='INSCRITO'
-          AND bloqueado=FALSE
-    """)
-    participantes = fetchall_dict(cur)
+        cur.execute(
+            """
+            SELECT id, nome, email
+            FROM participantes
+            WHERE status='INSCRITO'
+              AND bloqueado=FALSE
+            """
+        )
+        participantes = fetchall_dict(cur)
 
-    if len(participantes) < (vagas + suplentes_qtd):
+        if len(participantes) < (vagas + suplentes_qtd):
+            raise HTTPException(status_code=400, detail="Participantes insuficientes.")
+
+        random.shuffle(participantes)
+
+        vencedores = participantes[:vagas]
+        suplentes = participantes[vagas : vagas + suplentes_qtd]
+        agora = datetime.now()
+
+        # vencedores
+        for idx, p in enumerate(vencedores, start=1):
+            pid = p["id"]
+            nome = p.get("nome") or ""
+            email = p.get("email") or ""
+
+            registrar_vencedor(pid, nome, email, conn=conn)
+            cur.execute(
+                """
+                UPDATE participantes
+                SET status='SELECIONADO',
+                    bloqueado=TRUE,
+                    confirmado=FALSE,
+                    data_sorteio=%s,
+                    prioridade=%s
+                WHERE id=%s
+                """,
+                (agora, idx, pid),
+            )
+
+        # suplentes
+        for idx, s in enumerate(suplentes, start=vagas + 1):
+            pid = s["id"]
+            cur.execute(
+                """
+                UPDATE participantes
+                SET status='SUPLENTE',
+                    confirmado=FALSE,
+                    data_sorteio=%s,
+                    prioridade=%s
+                WHERE id=%s
+                """,
+                (agora, idx, pid),
+            )
+
+        conn.commit()
+        return {"ok": True, "msg": "Sorteio realizado."}
+    finally:
         conn.close()
-        raise HTTPException(status_code=400, detail="Participantes insuficientes.")
-
-    random.shuffle(participantes)
-
-    vencedores = participantes[:vagas]
-    suplentes = participantes[vagas:vagas + suplentes_qtd]
-    agora = datetime.now()  # timestamp real no Postgres
-
-    # vencedores
-    for idx, p in enumerate(vencedores, start=1):
-        pid = p["id"]
-        nome = p.get("nome") or ""
-        email = p.get("email") or ""
-
-        registrar_vencedor(pid, nome, email, conn=conn)
-        cur.execute("""
-            UPDATE participantes
-            SET status='SELECIONADO',
-                bloqueado=TRUE,
-                confirmado=FALSE,
-                data_sorteio=%s,
-                prioridade=%s
-            WHERE id=%s
-        """, (agora, idx, pid))
-
-    # suplentes
-    for idx, s in enumerate(suplentes, start=vagas + 1):
-        pid = s["id"]
-        cur.execute("""
-            UPDATE participantes
-            SET status='SUPLENTE',
-                confirmado=FALSE,
-                data_sorteio=%s,
-                prioridade=%s
-            WHERE id=%s
-        """, (agora, idx, pid))
-
-    conn.commit()
-    conn.close()
-    return {"ok": True, "msg": "Sorteio realizado."}
 
 @app.post("/api/confirmar")
 def confirmar(payload: ConfirmarIn):
@@ -310,7 +359,13 @@ async def importar_csv(file: UploadFile = File(...)):
         except Exception:
             erros += 1
 
-    return {"ok": True, "msg": "Importação CSV concluída.", "importados": importados, "ignorados": ignorados, "erros": erros}
+    return {
+        "ok": True,
+        "msg": "Importação CSV concluída.",
+        "importados": importados,
+        "ignorados": ignorados,
+        "erros": erros,
+    }
 
 @app.post("/api/importar-excel")
 async def importar_excel(file: UploadFile = File(...)):
@@ -352,14 +407,18 @@ def _xlsx_response(wb: Workbook, filename: str) -> StreamingResponse:
 @app.get("/api/exportar-participantes")
 def exportar_participantes():
     conn = conectar()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, nome, email, cpf, whatsapp, curso, perfil, status, bloqueado, semestre, confirmado, data_sorteio, prioridade
-        FROM participantes
-        ORDER BY id ASC
-    """)
-    rows = fetchall_dict(cur)
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, nome, email, cpf, whatsapp, curso, perfil, status, bloqueado, semestre, confirmado, data_sorteio, prioridade
+            FROM participantes
+            ORDER BY id ASC
+            """
+        )
+        rows = fetchall_dict(cur)
+    finally:
+        conn.close()
 
     wb = Workbook()
     ws = wb.active
@@ -378,34 +437,39 @@ def exportar_participantes():
 @app.get("/api/exportar-resultados")
 def exportar_resultados():
     conn = conectar()
-    cur = conn.cursor()
+    try:
+        cur = conn.cursor()
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Resultado"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Resultado"
 
-    def add_section(titulo: str, status: str):
-        ws.append([titulo])
-        ws.append(["ID", "Nome", "Email", "CPF", "WhatsApp", "Curso", "Perfil", "Semestre", "Data Sorteio", "Prioridade"])
-        cur.execute("""
-            SELECT id, nome, email, cpf, whatsapp, curso, perfil, semestre, data_sorteio, prioridade
-            FROM participantes
-            WHERE status=%s
-            ORDER BY prioridade ASC, id ASC
-        """, (status,))
-        for r in fetchall_dict(cur):
-            ws.append([
-                r.get("id"), r.get("nome"), r.get("email"), r.get("cpf"), r.get("whatsapp"),
-                r.get("curso"), r.get("perfil"), r.get("semestre"), r.get("data_sorteio"), r.get("prioridade")
-            ])
-        ws.append([])
+        def add_section(titulo: str, status: str):
+            ws.append([titulo])
+            ws.append(["ID", "Nome", "Email", "CPF", "WhatsApp", "Curso", "Perfil", "Semestre", "Data Sorteio", "Prioridade"])
+            cur.execute(
+                """
+                SELECT id, nome, email, cpf, whatsapp, curso, perfil, semestre, data_sorteio, prioridade
+                FROM participantes
+                WHERE status=%s
+                ORDER BY prioridade ASC, id ASC
+                """,
+                (status,),
+            )
+            for r in fetchall_dict(cur):
+                ws.append([
+                    r.get("id"), r.get("nome"), r.get("email"), r.get("cpf"), r.get("whatsapp"),
+                    r.get("curso"), r.get("perfil"), r.get("semestre"), r.get("data_sorteio"), r.get("prioridade")
+                ])
+            ws.append([])
 
-    add_section("CONFIRMADOS", "CONFIRMADO")
-    add_section("SELECIONADOS (aguardando confirmação)", "SELECIONADO")
-    add_section("SUPLENTES", "SUPLENTE")
-    add_section("INSCRITOS", "INSCRITO")
+        add_section("CONFIRMADOS", "CONFIRMADO")
+        add_section("SELECIONADOS (aguardando confirmação)", "SELECIONADO")
+        add_section("SUPLENTES", "SUPLENTE")
+        add_section("INSCRITOS", "INSCRITO")
 
-    conn.close()
+    finally:
+        conn.close()
 
     nome_arquivo = f"resultado_sorteio_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     return _xlsx_response(wb, nome_arquivo)
