@@ -1,8 +1,7 @@
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from io import BytesIO
 
-import sqlite3
 from openpyxl import Workbook, load_workbook
 
 try:
@@ -12,87 +11,120 @@ except Exception:
 
 
 # -----------------------------
+# HELPERS
+# -----------------------------
+
+def _norm_str(x) -> str:
+    return ("" if x is None else str(x)).strip()
+
+def _safe_lower(x) -> str:
+    return _norm_str(x).lower()
+
+def _pg_unique_msg(exc: Exception) -> str:
+    """
+    Tenta traduzir violação de UNIQUE no Postgres/pg8000.
+    """
+    msg = (str(exc) or "").lower()
+    # mensagens comuns do postgres: 'duplicate key value violates unique constraint "...email..."'
+    if "unique" in msg or "duplicate key" in msg:
+        if "email" in msg:
+            return "Esse e-mail já está cadastrado."
+        if "cpf" in msg:
+            return "Esse CPF já está cadastrado."
+        return "Registro duplicado (chave única)."
+    return "Erro ao salvar dados."
+
+
+# -----------------------------
 # CADASTRAR / ATUALIZAR (UPSERT)
 # -----------------------------
 
 def cadastrar_participante(nome, email, cpf, whatsapp, curso, perfil, semestre):
-    conexao = conectar()
-    cursor = conexao.cursor()
-
-    nome = (nome or "").strip()
-    email = (email or "").strip()
-    cpf = (cpf or "").strip()
-    whatsapp = (whatsapp or "").strip()
-    curso = (curso or "").strip()
-    perfil = (perfil or "").strip()
-    semestre = (semestre or "").strip()
+    """
+    Regras:
+    - nome obrigatório
+    - se tiver email, faz UPSERT por email
+    - senão, se tiver cpf, faz UPSERT por cpf
+    - senão, insere novo registro (sem chave única)
+    """
+    nome = _norm_str(nome)
+    email = _norm_str(email)
+    cpf = _norm_str(cpf)
+    whatsapp = _norm_str(whatsapp)
+    curso = _norm_str(curso)
+    perfil = _norm_str(perfil)
+    semestre = _norm_str(semestre)
 
     if not nome:
-        conexao.close()
         raise ValueError("Nome é obrigatório.")
 
-    existe = None
-
-    # procura por email/cpf SOMENTE se estiver preenchido
-    if email:
-        cursor.execute("SELECT id FROM participantes WHERE email = %s", (email,))
-        existe = cursor.fetchone()
-
-    if not existe and cpf:
-        cursor.execute("SELECT id FROM participantes WHERE cpf = ?", (cpf,))
-        existe = cursor.fetchone()
+    conn = conectar()
+    cur = conn.cursor()
 
     try:
-        if existe:
-            cursor.execute("""
-                UPDATE participantes
-                SET nome=?,
-                    email=?,
-                    cpf=?,
-                    whatsapp=?,
-                    curso=?,
-                    perfil=?,
-                    semestre=?,
-                    status='INSCRITO',
-                    bloqueado=0
-                WHERE id=?
-            """, (
-                nome,
-                email or None,
-                cpf or None,
-                whatsapp,
-                curso,
-                perfil,
-                semestre,
-                existe[0]
-            ))
-        else:
-            cursor.execute("""
+        # Preferência: email (mais confiável)
+        if email:
+            cur.execute(
+                """
                 INSERT INTO participantes
-                (nome, email, cpf, whatsapp, curso, perfil, semestre)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                nome,
-                email or None,
-                cpf or None,
-                whatsapp,
-                curso,
-                perfil,
-                semestre
-            ))
+                    (nome, email, cpf, whatsapp, curso, perfil, semestre, status, bloqueado, confirmado)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, 'INSCRITO', FALSE, FALSE)
+                ON CONFLICT (email) DO UPDATE SET
+                    nome       = EXCLUDED.nome,
+                    cpf        = EXCLUDED.cpf,
+                    whatsapp   = EXCLUDED.whatsapp,
+                    curso      = EXCLUDED.curso,
+                    perfil     = EXCLUDED.perfil,
+                    semestre   = EXCLUDED.semestre,
+                    status     = 'INSCRITO',
+                    bloqueado  = FALSE,
+                    confirmado = FALSE
+                """,
+                (nome, email or None, cpf or None, whatsapp, curso, perfil, semestre),
+            )
 
-        conexao.commit()
+        # Senão: cpf
+        elif cpf:
+            cur.execute(
+                """
+                INSERT INTO participantes
+                    (nome, email, cpf, whatsapp, curso, perfil, semestre, status, bloqueado, confirmado)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, 'INSCRITO', FALSE, FALSE)
+                ON CONFLICT (cpf) DO UPDATE SET
+                    nome       = EXCLUDED.nome,
+                    email      = EXCLUDED.email,
+                    whatsapp   = EXCLUDED.whatsapp,
+                    curso      = EXCLUDED.curso,
+                    perfil     = EXCLUDED.perfil,
+                    semestre   = EXCLUDED.semestre,
+                    status     = 'INSCRITO',
+                    bloqueado  = FALSE,
+                    confirmado = FALSE
+                """,
+                (nome, email or None, cpf or None, whatsapp, curso, perfil, semestre),
+            )
 
-    except sqlite3.IntegrityError as e:
-        conexao.rollback()
-        msg = str(e).lower()
-        if "participantes.email" in msg:
-            raise ValueError("Esse e-mail já está cadastrado.")
-        if "participantes.cpf" in msg:
-            raise ValueError("Esse CPF já está cadastrado.")
-        raise ValueError("Dados inválidos ou duplicados.")
+        # Sem email e sem cpf: só insere (pode repetir)
+        else:
+            cur.execute(
+                """
+                INSERT INTO participantes
+                    (nome, email, cpf, whatsapp, curso, perfil, semestre, status, bloqueado, confirmado)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, 'INSCRITO', FALSE, FALSE)
+                """,
+                (nome, None, None, whatsapp, curso, perfil, semestre),
+            )
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        raise ValueError(_pg_unique_msg(e))
     finally:
-        conexao.close()
+        conn.close()
 
 
 # -----------------------------
@@ -100,26 +132,28 @@ def cadastrar_participante(nome, email, cpf, whatsapp, curso, perfil, semestre):
 # -----------------------------
 
 def confirmar_presenca_por_email(email: str) -> int:
-    conexao = conectar()
-    cursor = conexao.cursor()
+    conn = conectar()
+    cur = conn.cursor()
 
-    email_norm = (email or "").strip().lower()
+    email_norm = _safe_lower(email)
     if not email_norm:
-        conexao.close()
+        conn.close()
         return 0
 
-    cursor.execute("""
+    cur.execute(
+        """
         UPDATE participantes
-        SET confirmado = 1,
+        SET confirmado = TRUE,
             status = 'CONFIRMADO'
         WHERE status = 'SELECIONADO'
           AND email IS NOT NULL
-          AND LOWER(TRIM(email)) = ?
-    """, (email_norm,))
-
-    alterados = cursor.rowcount
-    conexao.commit()
-    conexao.close()
+          AND LOWER(TRIM(email)) = %s
+        """,
+        (email_norm,),
+    )
+    alterados = cur.rowcount
+    conn.commit()
+    conn.close()
     return alterados
 
 
@@ -127,36 +161,31 @@ def confirmar_presenca_por_email(email: str) -> int:
 # PROMOVER SUPLENTE
 # -----------------------------
 
-try:
-    from backend.database import conectar, registrar_vencedor
-except Exception:
-    from database import conectar, registrar_vencedor
-
-
 def promover_suplente_se_expirou(prazo_horas: int = 48) -> Tuple[bool, str]:
     if prazo_horas < 0:
         return False, "prazo_horas inválido (deve ser >= 0)."
 
     limite_dt = datetime.now() - timedelta(hours=prazo_horas)
-    limite_str = limite_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     conn = conectar()
     cur = conn.cursor()
 
     try:
-        # 1) selecionado expirado (não confirmado)
-        cur.execute("""
+        # 1) pega 1 selecionado expirado (não confirmado)
+        cur.execute(
+            """
             SELECT id, prioridade
             FROM participantes
             WHERE status='SELECIONADO'
-              AND confirmado=0
+              AND confirmado=FALSE
               AND data_sorteio IS NOT NULL
-              AND data_sorteio <= ?
+              AND data_sorteio <= %s
             ORDER BY data_sorteio ASC
             LIMIT 1
-        """, (limite_str,))
+            """,
+            (limite_dt,),
+        )
         expirado = cur.fetchone()
-
         if not expirado:
             return False, "Nenhum selecionado expirado encontrado."
 
@@ -164,60 +193,68 @@ def promover_suplente_se_expirou(prazo_horas: int = 48) -> Tuple[bool, str]:
         expirado_prioridade = expirado[1]
 
         # 2) pega o primeiro suplente
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id, nome, email
             FROM participantes
             WHERE status='SUPLENTE'
             ORDER BY prioridade ASC
             LIMIT 1
-        """)
+            """
+        )
         suplente = cur.fetchone()
 
         if not suplente:
-            # marca expirado e libera (não trava o sistema)
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE participantes
-                SET status='EXPIRADO', bloqueado=0
-                WHERE id=?
-            """, (expirado_id,))
+                SET status='EXPIRADO', bloqueado=FALSE
+                WHERE id=%s
+                """,
+                (expirado_id,),
+            )
             conn.commit()
             return False, "Nenhum suplente disponível; selecionado marcado como EXPIRADO."
 
-        supl_id, supl_nome, supl_email = suplente[0], suplente[1], suplente[2]
-        agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        supl_id, supl_nome, supl_email = suplente[0], (suplente[1] or ""), (suplente[2] or "")
+        agora = datetime.now()
 
         # 3) promove suplente
-        cur.execute("""
+        cur.execute(
+            """
             UPDATE participantes
             SET status='SELECIONADO',
-                bloqueado=1,
-                confirmado=0,
-                data_sorteio=?,
-                prioridade=?
-            WHERE id=?
-        """, (agora, expirado_prioridade, supl_id))
+                bloqueado=TRUE,
+                confirmado=FALSE,
+                data_sorteio=%s,
+                prioridade=%s
+            WHERE id=%s
+            """,
+            (agora, expirado_prioridade, supl_id),
+        )
 
-        # 4) marca expirado como EXPIRADO e libera
-        cur.execute("""
+        # 4) marca expirado
+        cur.execute(
+            """
             UPDATE participantes
-            SET status='EXPIRADO', bloqueado=0
-            WHERE id=?
-        """, (expirado_id,))
+            SET status='EXPIRADO', bloqueado=FALSE
+            WHERE id=%s
+            """,
+            (expirado_id,),
+        )
 
-        # 5) registra no histórico
-        registrar_vencedor(supl_id, supl_nome or "", supl_email or "", conn=conn)
+        # 5) histórico
+        registrar_vencedor(supl_id, supl_nome, supl_email, conn=conn)
 
         conn.commit()
         return True, f"Suplente promovido: {supl_nome} ({supl_email})."
 
-    except sqlite3.OperationalError as e:
-        conn.rollback()
-        return False, f"Erro SQL: {e}"
     except Exception as e:
         conn.rollback()
-        return False, f"Erro inesperado: {type(e).__name__}: {e}"
+        return False, f"Erro: {type(e).__name__}: {e}"
     finally:
         conn.close()
+
 
 # -----------------------------
 # HISTÓRICO
@@ -226,12 +263,14 @@ def promover_suplente_se_expirou(prazo_horas: int = 48) -> Tuple[bool, str]:
 def listar_historico() -> List[Tuple[str, str, str, str]]:
     conn = conectar()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         SELECT h.data_sorteio, h.nome, h.email, COALESCE(p.status, 'REMOVIDO')
         FROM historico_sorteios h
         LEFT JOIN participantes p ON p.id = h.participante_id
         ORDER BY h.id DESC
-    """)
+        """
+    )
     rows = cur.fetchall()
     conn.close()
     return [(r[0], r[1], r[2], r[3]) for r in rows]
@@ -240,11 +279,15 @@ def listar_historico() -> List[Tuple[str, str, str, str]]:
 def limpar_historico(reset_id: bool = True) -> int:
     conn = conectar()
     cur = conn.cursor()
+
     cur.execute("SELECT COUNT(*) FROM historico_sorteios")
-    total = cur.fetchone()[0]
-    cur.execute("DELETE FROM historico_sorteios")
+    total = int(cur.fetchone()[0] or 0)
+
     if reset_id:
-        cur.execute("DELETE FROM sqlite_sequence WHERE name='historico_sorteios'")
+        cur.execute("TRUNCATE TABLE historico_sorteios RESTART IDENTITY")
+    else:
+        cur.execute("DELETE FROM historico_sorteios")
+
     conn.commit()
     conn.close()
     return total
@@ -257,11 +300,14 @@ def limpar_historico(reset_id: bool = True) -> int:
 def exportar_participantes_xlsx() -> bytes:
     conn = conectar()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id, nome, email, cpf, whatsapp, curso, perfil, semestre, status, confirmado, data_sorteio, prioridade
+    cur.execute(
+        """
+        SELECT id, nome, email, cpf, whatsapp, curso, perfil, semestre,
+               status, confirmado, data_sorteio, prioridade
         FROM participantes
         ORDER BY id ASC
-    """)
+        """
+    )
     rows = cur.fetchall()
     conn.close()
 
@@ -275,10 +321,7 @@ def exportar_participantes_xlsx() -> bytes:
     ])
 
     for r in rows:
-        ws.append([
-            r[0], r[1], r[2], r[3], r[4], r[5], r[6],
-            r[7], r[8], r[9], r[10], r[11]
-        ])
+        ws.append(list(r))
 
     bio = BytesIO()
     wb.save(bio)
@@ -290,23 +333,25 @@ def exportar_participantes_xlsx() -> bytes:
 # -----------------------------
 
 def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
-    wb = load_workbook(BytesIO(file_bytes))
+    wb = load_workbook(BytesIO(file_bytes), data_only=True)
     ws = wb.active
 
+    # Cabeçalho normalizado
     header = []
     for cell in ws[1]:
-        header.append((str(cell.value).strip().lower() if cell.value is not None else ""))
+        header.append((_safe_lower(cell.value) if cell.value is not None else ""))
 
-    def idx(colname: str):
-        try:
-            return header.index(colname)
-        except ValueError:
-            return None
+    def idx(*names: str) -> Optional[int]:
+        for n in names:
+            n = _safe_lower(n)
+            if n in header:
+                return header.index(n)
+        return None
 
     col_nome = idx("nome")
-    col_email = idx("email") if idx("email") is not None else idx("e-mail")
+    col_email = idx("email", "e-mail", "e_mail")
     col_cpf = idx("cpf")
-    col_whats = idx("whatsapp") if idx("whatsapp") is not None else idx("whats") if idx("whats") is not None else idx("telefone")
+    col_whats = idx("whatsapp", "whats", "telefone", "celular")
     col_curso = idx("curso")
     col_perfil = idx("perfil")
     col_semestre = idx("semestre")
@@ -319,25 +364,26 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
 
     for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         try:
-            nome = (row[col_nome] if col_nome is not None else "") or ""
-            email = (row[col_email] if col_email is not None else "") or ""
-            cpf = (row[col_cpf] if col_cpf is not None else "") or ""
-            whatsapp = (row[col_whats] if col_whats is not None else "") or ""
-            curso = (row[col_curso] if col_curso is not None else "") or ""
-            perfil = (row[col_perfil] if col_perfil is not None else "") or ""
-            semestre = (row[col_semestre] if col_semestre is not None else "") or ""
+            nome = _norm_str(row[col_nome]) if col_nome is not None else ""
+            email = _norm_str(row[col_email]) if col_email is not None else ""
+            cpf = _norm_str(row[col_cpf]) if col_cpf is not None else ""
+            whatsapp = _norm_str(row[col_whats]) if col_whats is not None else ""
+            curso = _norm_str(row[col_curso]) if col_curso is not None else ""
+            perfil = _norm_str(row[col_perfil]) if col_perfil is not None else ""
+            semestre = _norm_str(row[col_semestre]) if col_semestre is not None else ""
 
-            if str(nome).strip() == "" and str(email).strip() == "" and str(cpf).strip() == "":
+            # linha totalmente vazia
+            if not nome and not email and not cpf:
                 continue
 
             cadastrar_participante(
-                str(nome).strip(),
-                str(email).strip(),
-                str(cpf).strip(),
-                str(whatsapp).strip(),
-                str(curso).strip(),
-                str(perfil).strip(),
-                str(semestre).strip(),
+                nome,
+                email,
+                cpf,
+                whatsapp,
+                curso,
+                perfil,
+                semestre,
             )
             importados += 1
 
@@ -348,5 +394,6 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
         "ok": True,
         "msg": f"Importação finalizada. {importados} linha(s) processada(s).",
         "importados": importados,
-        "erros": erros
+        "erros": erros,
+        "erros_qtd": len(erros),
     }
