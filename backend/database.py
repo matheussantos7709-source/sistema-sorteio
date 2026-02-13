@@ -5,9 +5,6 @@ from urllib.parse import urlparse, parse_qs
 import pg8000
 
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-
 def _parse_database_url(url: str):
     """
     Aceita:
@@ -19,7 +16,7 @@ def _parse_database_url(url: str):
 
     # Render/Heroku às vezes usa postgres://
     if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
+        url = "postgresql://" + url[len("postgres://") :]
 
     u = urlparse(url)
     qs = parse_qs(u.query)
@@ -30,20 +27,38 @@ def _parse_database_url(url: str):
     password = u.password or ""
     database = (u.path or "").lstrip("/")
 
-    # sslmode: require/disable/prefer...
+    # sslmode: require/disable/prefer/verify-full/verify-ca...
     sslmode = (qs.get("sslmode", ["require"])[0] or "require").lower()
 
     return host, port, user, password, database, sslmode
 
 
+def _make_ssl_context(sslmode: str):
+    """
+    Render costuma exigir SSL, mas pode falhar a validação do certificado no pg8000.
+    Então, para 'require/prefer' usamos SSL sem verificação.
+    Para 'disable' não usa SSL.
+    Para 'verify-ca/verify-full' tentaria validar (geralmente dá ruim sem CA).
+    """
+    sslmode = (sslmode or "require").lower()
+
+    if sslmode == "disable":
+        return None
+
+    # Para evitar: SSLCertVerificationError (self-signed / cadeia incompleta)
+    # Isso mantém criptografia (SSL), só desliga a validação do certificado.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def conectar():
-    host, port, user, password, database, sslmode = _parse_database_url(DATABASE_URL)
+    database_url = (os.getenv("DATABASE_URL") or "").strip()
+    host, port, user, password, database, sslmode = _parse_database_url(database_url)
 
-    ssl_ctx = None
-    if sslmode != "disable":
-        ssl_ctx = ssl.create_default_context()
+    ssl_ctx = _make_ssl_context(sslmode)
 
-    # pg8000 é DB-API: cursor() / execute() / fetchall()
     conn = pg8000.connect(
         user=user,
         password=password,
@@ -60,7 +75,8 @@ def criar_tabela():
     conn = conectar()
     cur = conn.cursor()
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS participantes (
             id SERIAL PRIMARY KEY,
             nome TEXT NOT NULL,
@@ -76,9 +92,11 @@ def criar_tabela():
             data_sorteio TIMESTAMP,
             prioridade INTEGER
         )
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS historico_sorteios (
             id SERIAL PRIMARY KEY,
             participante_id INTEGER,
@@ -86,7 +104,8 @@ def criar_tabela():
             email TEXT,
             data_sorteio TIMESTAMP DEFAULT NOW()
         )
-    """)
+        """
+    )
 
     conn.commit()
     conn.close()
