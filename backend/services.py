@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from io import BytesIO
+import unicodedata
+import re
 
 from openpyxl import Workbook, load_workbook
 
@@ -19,6 +21,32 @@ def _norm_str(x) -> str:
 
 def _safe_lower(x) -> str:
     return _norm_str(x).lower()
+
+def _strip_accents(s: str) -> str:
+    """
+    Remove acentos para facilitar match de cabeçalhos.
+    """
+    s = _norm_str(s)
+    if not s:
+        return ""
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", s)
+        if not unicodedata.combining(ch)
+    )
+
+def _norm_header_name(s: str) -> str:
+    """
+    Normaliza cabeçalhos:
+    - lower
+    - sem acento
+    - remove pontuação básica
+    - colapsa espaços
+    """
+    s = _strip_accents(s).lower()
+    s = s.replace("_", " ")
+    s = re.sub(r"[^\w\s]", " ", s)     # tira pontuação
+    s = re.sub(r"\s+", " ", s).strip() # colapsa espaços
+    return s
 
 def _pg_unique_msg(exc: Exception) -> str:
     """
@@ -336,28 +364,77 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
     wb = load_workbook(BytesIO(file_bytes), data_only=True)
     ws = wb.active
 
-    # Cabeçalho normalizado
-    header = []
+    # Cabeçalho normalizado (com remoção de acentos e pontuação)
+    header_raw = []
+    header_norm = []
     for cell in ws[1]:
-        header.append((_safe_lower(cell.value) if cell.value is not None else ""))
+        v = "" if cell.value is None else str(cell.value)
+        header_raw.append(v)
+        header_norm.append(_norm_header_name(v))
 
     def idx(*names: str) -> Optional[int]:
+        """
+        Procura índice por possíveis nomes normalizados.
+        """
         for n in names:
-            n = _safe_lower(n)
-            if n in header:
-                return header.index(n)
+            nn = _norm_header_name(n)
+            if nn in header_norm:
+                return header_norm.index(nn)
         return None
 
-    col_nome = idx("nome")
-    col_email = idx("email", "e-mail", "e_mail")
-    col_cpf = idx("cpf")
-    col_whats = idx("whatsapp", "whats", "telefone", "celular")
+    # --- Compatível com seu formato antigo e com a planilha real do Google Forms ---
+    # Nome (obrigatório)
+    col_nome = idx(
+        "nome",
+        "nome da crianca",
+        "nome da criança",
+        "nome completo",
+        "crianca",
+        "criança",
+    )
+
+    # Email (recomendado / necessário para confirmar presença)
+    col_email = idx(
+        "email", "e-mail", "e_mail",
+        "e mail para contato",
+        "email para contato",
+        "e-mail para contato",
+    )
+
+    # WhatsApp/Telefone (opcional)
+    col_whats = idx(
+        "whatsapp", "whats", "telefone", "celular",
+        "telefone de contato do(a) responsavel",
+        "telefone de contato do(a) responsável",
+        "telefone de contato do responsavel",
+        "telefone de contato do responsável",
+    )
+
+    # Documento (opcional)
+    col_cpf = idx(
+        "cpf",
+        "documento",
+        "documento do(a) responsavel e tipo de documento",
+        "documento do(a) responsável e tipo de documento",
+        "rg",
+        "cpf/rg",
+    )
+
+    # Campos NÃO necessários pro sorteio — ficam vazios
+    # (mantemos compatibilidade com tabela)
     col_curso = idx("curso")
     col_perfil = idx("perfil")
     col_semestre = idx("semestre")
 
     if col_nome is None:
-        return {"ok": False, "msg": "Planilha inválida: falta a coluna 'nome' no cabeçalho.", "importados": 0, "erros": []}
+        # Ajuda a debugar mostrando cabeçalhos encontrados
+        return {
+            "ok": False,
+            "msg": "Planilha inválida: não encontrei uma coluna de NOME (ex: 'Nome da criança' ou 'nome').",
+            "importados": 0,
+            "erros": [],
+            "cabecalhos_detectados": header_raw[:],
+        }
 
     importados = 0
     erros: List[Dict[str, Any]] = []
@@ -366,8 +443,10 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
         try:
             nome = _norm_str(row[col_nome]) if col_nome is not None else ""
             email = _norm_str(row[col_email]) if col_email is not None else ""
-            cpf = _norm_str(row[col_cpf]) if col_cpf is not None else ""
             whatsapp = _norm_str(row[col_whats]) if col_whats is not None else ""
+            cpf = _norm_str(row[col_cpf]) if col_cpf is not None else ""
+
+            # (opcionais antigos) - se vierem, ok; se não, ficam vazios
             curso = _norm_str(row[col_curso]) if col_curso is not None else ""
             perfil = _norm_str(row[col_perfil]) if col_perfil is not None else ""
             semestre = _norm_str(row[col_semestre]) if col_semestre is not None else ""
@@ -376,14 +455,17 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
             if not nome and not email and not cpf:
                 continue
 
+            # regra mínima pro sistema:
+            # - nome é obrigatório (cadastrar_participante já valida)
+            # - email é MUITO recomendado (confirmação usa email)
             cadastrar_participante(
-                nome,
-                email,
-                cpf,
-                whatsapp,
-                curso,
-                perfil,
-                semestre,
+                nome=nome,
+                email=email,
+                cpf=cpf,
+                whatsapp=whatsapp,
+                curso=curso,       # pode vir vazio
+                perfil=perfil,     # pode vir vazio
+                semestre=semestre  # pode vir vazio
             )
             importados += 1
 
