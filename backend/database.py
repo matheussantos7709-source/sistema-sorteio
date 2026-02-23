@@ -36,17 +36,13 @@ def _parse_database_url(url: str):
 def _make_ssl_context(sslmode: str):
     """
     Render costuma exigir SSL, mas pode falhar a validação do certificado no pg8000.
-    Então, para 'require/prefer' usamos SSL sem verificação.
-    Para 'disable' não usa SSL.
-    Para 'verify-ca/verify-full' tentaria validar (geralmente dá ruim sem CA).
+    Para 'require/prefer' usamos SSL sem verificação.
     """
     sslmode = (sslmode or "require").lower()
 
     if sslmode == "disable":
         return None
 
-    # Para evitar: SSLCertVerificationError (self-signed / cadeia incompleta)
-    # Isso mantém criptografia (SSL), só desliga a validação do certificado.
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -75,14 +71,14 @@ def criar_tabela():
     conn = conectar()
     cur = conn.cursor()
 
+    # participantes (SEM unique em email/cpf; a chave é a única)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS participantes (
             id SERIAL PRIMARY KEY,
-            chave TEXT UNIQUE,   -- <- CHAVE ÚNICA (nome da criança + contato)
             nome TEXT NOT NULL,
-            email TEXT,          -- <- NÃO é mais UNIQUE
-            cpf TEXT,            -- <- NÃO é mais UNIQUE
+            email TEXT,
+            cpf TEXT,
             whatsapp TEXT,
             curso TEXT,
             perfil TEXT,
@@ -96,6 +92,15 @@ def criar_tabela():
         """
     )
 
+    # garante coluna chave (para DBs antigos)
+    cur.execute("ALTER TABLE participantes ADD COLUMN IF NOT EXISTS chave TEXT")
+
+    # índice/unique da chave (idempotente)
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS participantes_chave_uidx ON participantes(chave)"
+    )
+
+    # histórico
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS historico_sorteios (
@@ -104,6 +109,18 @@ def criar_tabela():
             nome TEXT,
             email TEXT,
             data_sorteio TIMESTAMP DEFAULT NOW()
+        )
+        """
+    )
+
+    # bloqueio permanente (nunca apagamos)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bloqueados_permanentes (
+            chave TEXT PRIMARY KEY,
+            nome TEXT,
+            email TEXT,
+            data_confirmacao TIMESTAMP DEFAULT NOW()
         )
         """
     )
