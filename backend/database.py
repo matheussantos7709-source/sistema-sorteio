@@ -79,9 +79,10 @@ def criar_tabela():
         """
         CREATE TABLE IF NOT EXISTS participantes (
             id SERIAL PRIMARY KEY,
+            chave TEXT UNIQUE,   -- <- CHAVE ÚNICA (nome da criança + contato)
             nome TEXT NOT NULL,
-            email TEXT UNIQUE,
-            cpf TEXT UNIQUE,
+            email TEXT,          -- <- NÃO é mais UNIQUE
+            cpf TEXT,            -- <- NÃO é mais UNIQUE
             whatsapp TEXT,
             curso TEXT,
             perfil TEXT,
