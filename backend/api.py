@@ -1,5 +1,5 @@
 # backend/api.py
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -74,6 +74,19 @@ def _mask_db_url(url: str) -> str:
     except Exception:
         return "***"
 
+def _require_admin(x_admin_key: Optional[str]):
+    """
+    Protege endpoints administrativos.
+    Envie o header: X-ADMIN-KEY: <sua-chave>
+    """
+    expected = (os.getenv("ADMIN_KEY") or "").strip()
+    if not expected:
+        # Se você esquecer de configurar no Render, isso aqui protege de acidente
+        raise HTTPException(status_code=500, detail="ADMIN_KEY não configurada no servidor.")
+    if not x_admin_key or x_admin_key.strip() != expected:
+        raise HTTPException(status_code=401, detail="Não autorizado (admin).")
+
+
 # ---------------------------
 # MODELOS
 # ---------------------------
@@ -97,6 +110,7 @@ class ConfirmarIn(BaseModel):
 class PromoverIn(BaseModel):
     prazo_horas: int = 48
 
+
 # ---------------------------
 # ROTAS BÁSICAS
 # ---------------------------
@@ -118,6 +132,158 @@ def dbinfo() -> Dict[str, Any]:
         "database_url_set": bool(db_url),
         "database_url_masked": _mask_db_url(db_url) if db_url else "",
     }
+
+
+# ---------------------------
+# ADMIN - MIGRAÇÃO (OPÇÃO B)
+# ---------------------------
+
+@app.get("/api/admin/migracao-status")
+def migracao_status(x_admin_key: Optional[str] = Header(None)):
+    """
+    Verifica se a coluna 'chave' e o índice unique já existem.
+    """
+    _require_admin(x_admin_key)
+
+    conn = conectar()
+    try:
+        cur = conn.cursor()
+
+        # coluna chave existe?
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name='participantes' AND column_name='chave'
+            LIMIT 1
+            """
+        )
+        has_col = cur.fetchone() is not None
+
+        # índice existe?
+        cur.execute(
+            """
+            SELECT 1
+            FROM pg_indexes
+            WHERE tablename='participantes' AND indexname='participantes_chave_unique'
+            LIMIT 1
+            """
+        )
+        has_index = cur.fetchone() is not None
+
+        # constraints UNIQUE de email/cpf ainda existem?
+        cur.execute(
+            """
+            SELECT conname, pg_get_constraintdef(oid) AS def
+            FROM pg_constraint
+            WHERE conrelid = 'participantes'::regclass
+              AND contype='u'
+            """
+        )
+        uniques = [{"name": r[0], "def": r[1]} for r in cur.fetchall()]
+
+        return {
+            "ok": True,
+            "coluna_chave_existe": has_col,
+            "indice_chave_existe": has_index,
+            "unique_constraints": uniques,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/migrar-schema")
+def migrar_schema(x_admin_key: Optional[str] = Header(None)):
+    """
+    Migra o schema do Postgres para a Opção B:
+    - adiciona coluna 'chave' se não existir
+    - remove UNIQUE de email/cpf (se existirem)
+    - preenche chave nos registros existentes
+    - cria índice unique na chave
+
+    Use 1 vez e depois você pode remover esse endpoint.
+    """
+    _require_admin(x_admin_key)
+
+    conn = conectar()
+    try:
+        cur = conn.cursor()
+
+        # 1) cria coluna chave se não existir
+        cur.execute("ALTER TABLE participantes ADD COLUMN IF NOT EXISTS chave TEXT;")
+
+        # 2) remover UNIQUE de email (se existir)
+        cur.execute(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'participantes'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) ILIKE '%(email)%'
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        dropped_email = None
+        if row and row[0]:
+            dropped_email = row[0]
+            cur.execute(f'ALTER TABLE participantes DROP CONSTRAINT "{dropped_email}";')
+
+        # 3) remover UNIQUE de cpf (se existir)
+        cur.execute(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'participantes'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) ILIKE '%(cpf)%'
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        dropped_cpf = None
+        if row and row[0]:
+            dropped_cpf = row[0]
+            cur.execute(f'ALTER TABLE participantes DROP CONSTRAINT "{dropped_cpf}";')
+
+        # 4) preencher chave para registros antigos
+        # chave = lower(trim(nome)) + '|' + (email ou cpf ou whatsapp ou 'sem-contato')
+        cur.execute(
+            """
+            UPDATE participantes
+            SET chave =
+                LOWER(TRIM(nome)) || '|' ||
+                COALESCE(NULLIF(LOWER(TRIM(email)), ''),
+                         NULLIF(LOWER(TRIM(cpf)), ''),
+                         NULLIF(LOWER(TRIM(whatsapp)), ''),
+                         'sem-contato')
+            WHERE chave IS NULL OR chave = '';
+            """
+        )
+        updated_keys = cur.rowcount
+
+        # 5) criar índice unique na chave
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS participantes_chave_unique ON participantes(chave);"
+        )
+
+        conn.commit()
+
+        return {
+            "ok": True,
+            "msg": "Migração executada com sucesso.",
+            "email_unique_removido": dropped_email or False,
+            "cpf_unique_removido": dropped_cpf or False,
+            "chaves_preenchidas": updated_keys,
+            "indice_criado": True,
+        }
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro na migração: {type(e).__name__}: {e}")
+    finally:
+        conn.close()
+
 
 # ---------------------------
 # PARTICIPANTES
@@ -203,6 +369,7 @@ def deletar_participante(pid: int):
         return {"ok": True, "msg": "Participante removido."}
     finally:
         conn.close()
+
 
 # ---------------------------
 # SORTEIO / CONFIRMAÇÃO / PROMOÇÃO
@@ -295,6 +462,7 @@ def promover(payload: PromoverIn):
     ok, msg = promover_suplente_se_expirou(prazo)
     return {"ok": ok, "msg": msg}
 
+
 # ---------------------------
 # HISTÓRICO
 # ---------------------------
@@ -308,6 +476,7 @@ def historico():
 def apagar_historico(reset_id: bool = True):
     apagados = limpar_historico(reset_id=reset_id)
     return {"ok": True, "apagados": apagados}
+
 
 # ---------------------------
 # IMPORTAÇÃO
@@ -389,6 +558,7 @@ async def importar_excel(file: UploadFile = File(...)):
         "erros": erros_list,
         "erros_qtd": len(erros_list),
     }
+
 
 # ---------------------------
 # EXPORTAÇÃO
