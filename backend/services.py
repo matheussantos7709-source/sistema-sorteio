@@ -24,7 +24,7 @@ def _safe_lower(x) -> str:
 
 def _strip_accents(s: str) -> str:
     """
-    Remove acentos para facilitar match de cabeçalhos.
+    Remove acentos para facilitar match de cabeçalhos e geração de chave.
     """
     s = _norm_str(s)
     if not s:
@@ -48,32 +48,48 @@ def _norm_header_name(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip() # colapsa espaços
     return s
 
+def _key_norm(s: str) -> str:
+    """
+    Normalização para montar a chave única.
+    """
+    s = _strip_accents(s).lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _make_chave(nome: str, email: str, cpf: str, whatsapp: str) -> str:
+    """
+    Chave única por criança + contato do responsável.
+    - se tiver email, usa email
+    - senão, usa cpf
+    - senão, usa whatsapp
+    - senão, "sem-contato"
+    """
+    nome_n = _key_norm(nome)
+    contato = _key_norm(email) or _key_norm(cpf) or _key_norm(whatsapp) or "sem-contato"
+    return f"{nome_n}|{contato}"
+
 def _pg_unique_msg(exc: Exception) -> str:
     """
     Tenta traduzir violação de UNIQUE no Postgres/pg8000.
     """
     msg = (str(exc) or "").lower()
-    # mensagens comuns do postgres: 'duplicate key value violates unique constraint "...email..."'
     if "unique" in msg or "duplicate key" in msg:
-        if "email" in msg:
-            return "Esse e-mail já está cadastrado."
-        if "cpf" in msg:
-            return "Esse CPF já está cadastrado."
+        if "chave" in msg:
+            return "Registro duplicado (mesma criança e mesmo contato)."
         return "Registro duplicado (chave única)."
     return "Erro ao salvar dados."
 
 
 # -----------------------------
-# CADASTRAR / ATUALIZAR (UPSERT)
+# CADASTRAR / ATUALIZAR (UPSERT) - AGORA POR CHAVE
 # -----------------------------
 
 def cadastrar_participante(nome, email, cpf, whatsapp, curso, perfil, semestre):
     """
-    Regras:
+    Regras (Opção B):
     - nome obrigatório
-    - se tiver email, faz UPSERT por email
-    - senão, se tiver cpf, faz UPSERT por cpf
-    - senão, insere novo registro (sem chave única)
+    - email/cpf NÃO são mais únicos (mãe pode ter 2 filhos)
+    - UPSERT por 'chave' (nome da criança + contato)
     """
     nome = _norm_str(nome)
     email = _norm_str(email)
@@ -86,65 +102,32 @@ def cadastrar_participante(nome, email, cpf, whatsapp, curso, perfil, semestre):
     if not nome:
         raise ValueError("Nome é obrigatório.")
 
+    chave = _make_chave(nome, email, cpf, whatsapp)
+
     conn = conectar()
     cur = conn.cursor()
 
     try:
-        # Preferência: email (mais confiável)
-        if email:
-            cur.execute(
-                """
-                INSERT INTO participantes
-                    (nome, email, cpf, whatsapp, curso, perfil, semestre, status, bloqueado, confirmado)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, 'INSCRITO', FALSE, FALSE)
-                ON CONFLICT (email) DO UPDATE SET
-                    nome       = EXCLUDED.nome,
-                    cpf        = EXCLUDED.cpf,
-                    whatsapp   = EXCLUDED.whatsapp,
-                    curso      = EXCLUDED.curso,
-                    perfil     = EXCLUDED.perfil,
-                    semestre   = EXCLUDED.semestre,
-                    status     = 'INSCRITO',
-                    bloqueado  = FALSE,
-                    confirmado = FALSE
-                """,
-                (nome, email or None, cpf or None, whatsapp, curso, perfil, semestre),
-            )
-
-        # Senão: cpf
-        elif cpf:
-            cur.execute(
-                """
-                INSERT INTO participantes
-                    (nome, email, cpf, whatsapp, curso, perfil, semestre, status, bloqueado, confirmado)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, 'INSCRITO', FALSE, FALSE)
-                ON CONFLICT (cpf) DO UPDATE SET
-                    nome       = EXCLUDED.nome,
-                    email      = EXCLUDED.email,
-                    whatsapp   = EXCLUDED.whatsapp,
-                    curso      = EXCLUDED.curso,
-                    perfil     = EXCLUDED.perfil,
-                    semestre   = EXCLUDED.semestre,
-                    status     = 'INSCRITO',
-                    bloqueado  = FALSE,
-                    confirmado = FALSE
-                """,
-                (nome, email or None, cpf or None, whatsapp, curso, perfil, semestre),
-            )
-
-        # Sem email e sem cpf: só insere (pode repetir)
-        else:
-            cur.execute(
-                """
-                INSERT INTO participantes
-                    (nome, email, cpf, whatsapp, curso, perfil, semestre, status, bloqueado, confirmado)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, 'INSCRITO', FALSE, FALSE)
-                """,
-                (nome, None, None, whatsapp, curso, perfil, semestre),
-            )
+        cur.execute(
+            """
+            INSERT INTO participantes
+                (chave, nome, email, cpf, whatsapp, curso, perfil, semestre, status, bloqueado, confirmado)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s, 'INSCRITO', FALSE, FALSE)
+            ON CONFLICT (chave) DO UPDATE SET
+                nome       = EXCLUDED.nome,
+                email      = EXCLUDED.email,
+                cpf        = EXCLUDED.cpf,
+                whatsapp   = EXCLUDED.whatsapp,
+                curso      = EXCLUDED.curso,
+                perfil     = EXCLUDED.perfil,
+                semestre   = EXCLUDED.semestre,
+                status     = 'INSCRITO',
+                bloqueado  = FALSE,
+                confirmado = FALSE
+            """,
+            (chave, nome, email or None, cpf or None, whatsapp, curso, perfil, semestre),
+        )
 
         conn.commit()
 
@@ -373,17 +356,12 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
         header_norm.append(_norm_header_name(v))
 
     def idx(*names: str) -> Optional[int]:
-        """
-        Procura índice por possíveis nomes normalizados.
-        """
         for n in names:
             nn = _norm_header_name(n)
             if nn in header_norm:
                 return header_norm.index(nn)
         return None
 
-    # --- Compatível com seu formato antigo e com a planilha real do Google Forms ---
-    # Nome (obrigatório)
     col_nome = idx(
         "nome",
         "nome da crianca",
@@ -393,7 +371,6 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
         "criança",
     )
 
-    # Email (recomendado / necessário para confirmar presença)
     col_email = idx(
         "email", "e-mail", "e_mail",
         "e mail para contato",
@@ -401,7 +378,6 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
         "e-mail para contato",
     )
 
-    # WhatsApp/Telefone (opcional)
     col_whats = idx(
         "whatsapp", "whats", "telefone", "celular",
         "telefone de contato do(a) responsavel",
@@ -410,7 +386,6 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
         "telefone de contato do responsável",
     )
 
-    # Documento (opcional)
     col_cpf = idx(
         "cpf",
         "documento",
@@ -420,14 +395,11 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
         "cpf/rg",
     )
 
-    # Campos NÃO necessários pro sorteio — ficam vazios
-    # (mantemos compatibilidade com tabela)
     col_curso = idx("curso")
     col_perfil = idx("perfil")
     col_semestre = idx("semestre")
 
     if col_nome is None:
-        # Ajuda a debugar mostrando cabeçalhos encontrados
         return {
             "ok": False,
             "msg": "Planilha inválida: não encontrei uma coluna de NOME (ex: 'Nome da criança' ou 'nome').",
@@ -446,26 +418,21 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
             whatsapp = _norm_str(row[col_whats]) if col_whats is not None else ""
             cpf = _norm_str(row[col_cpf]) if col_cpf is not None else ""
 
-            # (opcionais antigos) - se vierem, ok; se não, ficam vazios
             curso = _norm_str(row[col_curso]) if col_curso is not None else ""
             perfil = _norm_str(row[col_perfil]) if col_perfil is not None else ""
             semestre = _norm_str(row[col_semestre]) if col_semestre is not None else ""
 
-            # linha totalmente vazia
             if not nome and not email and not cpf:
                 continue
 
-            # regra mínima pro sistema:
-            # - nome é obrigatório (cadastrar_participante já valida)
-            # - email é MUITO recomendado (confirmação usa email)
             cadastrar_participante(
                 nome=nome,
                 email=email,
                 cpf=cpf,
                 whatsapp=whatsapp,
-                curso=curso,       # pode vir vazio
-                perfil=perfil,     # pode vir vazio
-                semestre=semestre  # pode vir vazio
+                curso=curso,
+                perfil=perfil,
+                semestre=semestre
             )
             importados += 1
 
