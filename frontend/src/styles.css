@@ -203,14 +203,22 @@ tr.selected {
   align-items:center;
   justify-content:center;
   padding: 18px;
+  z-index: 9999; /* garante ficar acima */
 }
+
 .modal {
   width: min(760px, 100%);
   background: rgba(15,23,42,0.92);
   border: 1px solid rgba(255,255,255,0.12);
   border-radius: 14px;
   box-shadow: 0 15px 45px rgba(0,0,0,0.45);
+
+  /* NOVO: limita altura e permite body rolar */
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
 }
+
 .modalHeader {
   padding: 12px 12px 0 12px;
   color:#e5e7eb;
@@ -218,8 +226,17 @@ tr.selected {
   display:flex;
   justify-content:space-between;
   align-items:center;
+  flex: 0 0 auto; /* header não encolhe */
 }
-.modalBody { padding: 12px; }
+
+/* NOVO: área rolável */
+.modalBody {
+  padding: 12px;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: auto;
+}
+
 .small {
   color:#9ca3af;
   font-size: 12px;
