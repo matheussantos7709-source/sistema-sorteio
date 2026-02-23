@@ -553,11 +553,11 @@ async def importar_excel(file: UploadFile = File(...)):
     return {
         "ok": True,
         "msg": result.get("msg", "Importação Excel concluída."),
-        "importados": importados,
-        "ignorados": 0,
+        "importados": int(result.get("importados", 0) or 0),
+        "ignorados": int(result.get("ignorados", 0) or 0),
         "erros": erros_list,
         "erros_qtd": len(erros_list),
-    }
+}
 
 
 # ---------------------------
