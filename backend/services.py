@@ -1,3 +1,4 @@
+# backend/services.py
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from io import BytesIO
@@ -53,25 +54,27 @@ def _norm_key_piece(s: str) -> str:
 def _norm_header_name(s: str) -> str:
     return _norm_key_piece(s)
 
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D+", "", _norm_str(s))
+
 def _build_chave(nome: str, email: str, cpf: str, whatsapp: str) -> str:
     """
-    Regra da chave (única):
     chave = NOME_NORMALIZADO | IDENTIFICADOR
 
     Identificador prioridade:
-      1) email
-      2) cpf
-      3) whatsapp
+      1) email (normalizado)
+      2) cpf (só dígitos)
+      3) whatsapp (só dígitos)
       4) sem_contato
     """
     nome_k = _norm_key_piece(nome)
-    ident = ""
+
     if _norm_str(email):
         ident = _norm_key_piece(email)
     elif _norm_str(cpf):
-        ident = re.sub(r"\D+", "", _norm_str(cpf))  # só dígitos
+        ident = _digits_only(cpf) or "sem_contato"
     elif _norm_str(whatsapp):
-        ident = re.sub(r"\D+", "", _norm_str(whatsapp))
+        ident = _digits_only(whatsapp) or "sem_contato"
     else:
         ident = "sem_contato"
 
@@ -82,7 +85,6 @@ def _pg_unique_msg(exc: Exception) -> str:
     if "unique" in msg or "duplicate key" in msg:
         return "Registro duplicado (chave única)."
     return "Erro ao salvar dados."
-
 
 def _is_bloqueado_permanente(chave: str) -> bool:
     chave = _norm_str(chave)
@@ -106,6 +108,7 @@ def cadastrar_participante(nome, email, cpf, whatsapp, curso, perfil, semestre):
     Regras:
     - nome obrigatório
     - gera chave estável (nome + contato)
+    - se chave já estiver em bloqueados_permanentes -> NÃO cadastra (Opção B)
     - UPSERT por chave (única)
     """
     nome = _norm_spaces(nome)
@@ -120,6 +123,10 @@ def cadastrar_participante(nome, email, cpf, whatsapp, curso, perfil, semestre):
         raise ValueError("Nome é obrigatório.")
 
     chave = _build_chave(nome, email, cpf, whatsapp)
+
+    # OPÇÃO B: se já foi selecionado no passado, não entra de novo
+    if _is_bloqueado_permanente(chave):
+        raise ValueError("Este participante já foi selecionado anteriormente (bloqueio permanente).")
 
     conn = conectar()
     cur = conn.cursor()
@@ -155,13 +162,14 @@ def cadastrar_participante(nome, email, cpf, whatsapp, curso, perfil, semestre):
 
 
 # -----------------------------
-# CONFIRMAR PRESENÇA (e BLOQUEAR PERMANENTE)
+# CONFIRMAR PRESENÇA
 # -----------------------------
 
 def confirmar_presenca_por_email(email: str) -> int:
     """
-    Confirma TODOS os selecionados que tenham esse email (grupo),
-    e registra a chave deles em bloqueados_permanentes.
+    Confirma TODOS os selecionados que tenham esse email.
+    (Na Opção B o bloqueio permanente já aconteceu no sorteio,
+     mas manter aqui não faz mal: ON CONFLICT DO NOTHING.)
     """
     email_norm = _safe_lower(email)
     if not email_norm:
@@ -171,7 +179,6 @@ def confirmar_presenca_por_email(email: str) -> int:
     cur = conn.cursor()
 
     try:
-        # 1) confirma e retorna os confirmados
         cur.execute(
             """
             UPDATE participantes
@@ -187,7 +194,7 @@ def confirmar_presenca_por_email(email: str) -> int:
         rows = cur.fetchall() or []
         alterados = len(rows)
 
-        # 2) grava bloqueio permanente (somente quem confirmou)
+        # (opcional) reforça bloqueio permanente (idempotente)
         for (chave, nome, em) in rows:
             if not chave:
                 continue
@@ -224,6 +231,7 @@ def promover_suplente_se_expirou(prazo_horas: int = 48) -> Tuple[bool, str]:
     cur = conn.cursor()
 
     try:
+        # 1) pega 1 selecionado expirado (não confirmado)
         cur.execute(
             """
             SELECT id, prioridade
@@ -244,9 +252,10 @@ def promover_suplente_se_expirou(prazo_horas: int = 48) -> Tuple[bool, str]:
         expirado_id = expirado[0]
         expirado_prioridade = expirado[1]
 
+        # 2) pega o primeiro suplente
         cur.execute(
             """
-            SELECT id, nome, email
+            SELECT id, nome, email, chave
             FROM participantes
             WHERE status='SUPLENTE'
             ORDER BY prioridade ASC
@@ -267,9 +276,13 @@ def promover_suplente_se_expirou(prazo_horas: int = 48) -> Tuple[bool, str]:
             conn.commit()
             return False, "Nenhum suplente disponível; selecionado marcado como EXPIRADO."
 
-        supl_id, supl_nome, supl_email = suplente[0], (suplente[1] or ""), (suplente[2] or "")
+        supl_id = suplente[0]
+        supl_nome = (suplente[1] or "")
+        supl_email = (suplente[2] or "")
+        supl_chave = (suplente[3] or "")
         agora = datetime.now()
 
+        # 3) promove suplente
         cur.execute(
             """
             UPDATE participantes
@@ -283,6 +296,7 @@ def promover_suplente_se_expirou(prazo_horas: int = 48) -> Tuple[bool, str]:
             (agora, expirado_prioridade, supl_id),
         )
 
+        # 4) marca expirado
         cur.execute(
             """
             UPDATE participantes
@@ -292,7 +306,19 @@ def promover_suplente_se_expirou(prazo_horas: int = 48) -> Tuple[bool, str]:
             (expirado_id,),
         )
 
+        # 5) histórico
         registrar_vencedor(supl_id, supl_nome, supl_email, conn=conn)
+
+        # 6) OPÇÃO B: bloqueio permanente também quando suplente vira selecionado
+        if supl_chave:
+            cur.execute(
+                """
+                INSERT INTO bloqueados_permanentes (chave, nome, email, data_confirmacao)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (chave) DO NOTHING
+                """,
+                (supl_chave, supl_nome, supl_email),
+            )
 
         conn.commit()
         return True, f"Suplente promovido: {supl_nome} ({supl_email})."
@@ -400,12 +426,16 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
 
     col_nome = idx("nome", "nome da crianca", "nome da criança", "nome completo", "crianca", "criança")
     col_email = idx("email", "e-mail", "e_mail", "email para contato", "e-mail para contato", "e mail para contato")
-    col_whats = idx("whatsapp", "whats", "telefone", "celular",
-                    "telefone de contato do(a) responsavel", "telefone de contato do(a) responsável",
-                    "telefone de contato do responsavel", "telefone de contato do responsável")
-    col_cpf = idx("cpf", "documento", "rg", "cpf/rg",
-                  "documento do(a) responsavel e tipo de documento",
-                  "documento do(a) responsável e tipo de documento")
+    col_whats = idx(
+        "whatsapp", "whats", "telefone", "celular",
+        "telefone de contato do(a) responsavel", "telefone de contato do(a) responsável",
+        "telefone de contato do responsavel", "telefone de contato do responsável"
+    )
+    col_cpf = idx(
+        "cpf", "documento", "rg", "cpf/rg",
+        "documento do(a) responsavel e tipo de documento",
+        "documento do(a) responsável e tipo de documento"
+    )
 
     col_curso = idx("curso")
     col_perfil = idx("perfil")
@@ -439,7 +469,7 @@ def importar_participantes_xlsx(file_bytes: bytes) -> Dict[str, Any]:
             if not nome and not email and not cpf:
                 continue
 
-            # calcula chave e bloqueia se já confirmado no passado
+            # calcula chave e ignora se já foi bloqueado permanente
             chave = _build_chave(nome, email, cpf, whatsapp)
             if _is_bloqueado_permanente(chave):
                 ignorados += 1
