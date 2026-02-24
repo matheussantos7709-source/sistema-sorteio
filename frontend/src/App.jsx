@@ -69,6 +69,11 @@ export default function App() {
   const [historico, setHistorico] = useState([]);
   const [resetId, setResetId] = useState(true);
 
+  // bloqueados permanentes (NOVO)
+  const [bloqOpen, setBloqOpen] = useState(false);
+  const [bloqueados, setBloqueados] = useState([]);
+  const [bloqueadosTotal, setBloqueadosTotal] = useState(null);
+
   // forms
   const [cad, setCad] = useState({
     nome: "",
@@ -109,8 +114,19 @@ export default function App() {
     }
   }
 
+  async function carregarBloqueadosCount() {
+    try {
+      const r = await api.bloqueadosCount();
+      setBloqueadosTotal(Number(r?.total ?? 0));
+    } catch (e) {
+      // não quebra o site se o endpoint ainda não existir
+      setBloqueadosTotal(null);
+    }
+  }
+
   useEffect(() => {
     carregarParticipantes();
+    carregarBloqueadosCount();
   }, []);
 
   const participantesFiltrados = useMemo(() => {
@@ -277,8 +293,13 @@ export default function App() {
     setLoading(true);
     try {
       const r = await api.confirmar({ email });
-      if (r.ok) showOk("Confirmado com sucesso!");
-      else showErr(r.msg || "Não encontrado.");
+      if (r.ok) {
+        showOk("Confirmado com sucesso!");
+        // se confirmou, provavelmente aumentou a lista de bloqueados
+        carregarBloqueadosCount();
+      } else {
+        showErr(r.msg || "Não encontrado.");
+      }
       setConfirmEmail("");
       await carregarParticipantes();
     } catch (e) {
@@ -335,6 +356,27 @@ export default function App() {
     }
   }
 
+  // -------- BLOQUEADOS (NOVO) --------
+  async function abrirBloqueados() {
+    setLoading(true);
+    try {
+      const r = await api.listarBloqueados(800);
+      const items = Array.isArray(r?.items) ? r.items : [];
+      setBloqueados(items);
+      setBloqOpen(true);
+
+      // garante contador atualizado
+      if (typeof r?.items?.length === "number") {
+        // não é o total real, mas ajuda quando o count falhar
+      }
+      carregarBloqueadosCount();
+    } catch (e) {
+      showErr(e);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   // -------- IMPORTAÇÃO / EXPORTAÇÃO --------
   async function onImportarXlsx(file) {
     if (!file) return;
@@ -343,6 +385,8 @@ export default function App() {
       const r = await api.importarExcel(file);
       showOk(`Importação concluída! Importados: ${r.importados ?? 0} | Ignorados: ${r.ignorados ?? 0}`);
       await carregarParticipantes();
+      // após importar, pode ter ignorados por bloqueio -> atualiza contador
+      carregarBloqueadosCount();
     } catch (e) {
       showErr(e);
     } finally {
@@ -358,6 +402,7 @@ export default function App() {
       const r = await api.importarCsv(file);
       showOk(`Importação CSV ok! Importados: ${r.importados ?? 0} | Ignorados: ${r.ignorados ?? 0}`);
       await carregarParticipantes();
+      carregarBloqueadosCount();
     } catch (e) {
       showErr(e);
     } finally {
@@ -399,14 +444,26 @@ export default function App() {
           <div className="title">Sistema de Sorteio</div>
           <div className="sub">
             Participantes (tempo real) — <b>{participantes.length}</b> no total
+            {"  "}•{"  "}
+            Bloqueados permanentes —{" "}
+            <b>{bloqueadosTotal === null ? "?" : bloqueadosTotal}</b>
           </div>
         </div>
 
         <div style={{ display: "flex", gap: 10 }}>
-          <button onClick={carregarParticipantes} className="primary" disabled={loading}>
+          <button
+            onClick={async () => {
+              await carregarParticipantes();
+              await carregarBloqueadosCount();
+            }}
+            className="primary"
+            disabled={loading}
+          >
             {loading ? "Carregando..." : "Atualizar"}
           </button>
+
           <button onClick={abrirHistorico} disabled={loading}>Ver Histórico</button>
+          <button onClick={abrirBloqueados} disabled={loading}>Ver Bloqueados</button>
         </div>
       </div>
 
@@ -478,7 +535,7 @@ export default function App() {
                 <div className="cardHeader" style={{ padding: 0, marginBottom: 10 }}>Importação / Exportação</div>
 
                 <div className="small">
-                  Importar envia o arquivo pro backend e grava no SQLite. Exportar baixa um .xlsx gerado pela API.
+                  Importar envia o arquivo pro backend e grava no banco. Exportar baixa um .xlsx gerado pela API.
                 </div>
 
                 <div style={{ height: 10 }} />
@@ -746,6 +803,57 @@ export default function App() {
                 {historico.length === 0 && (
                   <tr>
                     <td colSpan={4} style={{ color: "#9ca3af" }}>Sem registros.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Modal>
+      )}
+
+      {/* MODAL BLOQUEADOS (NOVO) */}
+      {bloqOpen && (
+        <Modal title="Bloqueados permanentes" onClose={() => setBloqOpen(false)}>
+          <div className="actionsRow" style={{ justifyContent: "space-between" }}>
+            <div className="small">
+              Mostrando: <b>{bloqueados.length}</b>
+              {bloqueadosTotal !== null ? (
+                <>
+                  {" "}• Total: <b>{bloqueadosTotal}</b>
+                </>
+              ) : null}
+            </div>
+            <button onClick={abrirBloqueados} disabled={loading}>
+              Atualizar lista
+            </button>
+          </div>
+
+          <div style={{ height: 10 }} />
+
+          <div className="tableWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: 180 }}>Data</th>
+                  <th>Nome</th>
+                  <th>E-mail</th>
+                  <th style={{ width: 260 }}>Chave</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bloqueados.map((b, idx) => (
+                  <tr key={idx}>
+                    <td>{b.data_confirmacao || "-"}</td>
+                    <td>{b.nome || "-"}</td>
+                    <td>{b.email || "-"}</td>
+                    <td style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace", fontSize: 12 }}>
+                      {b.chave || "-"}
+                    </td>
+                  </tr>
+                ))}
+                {bloqueados.length === 0 && (
+                  <tr>
+                    <td colSpan={4} style={{ color: "#9ca3af" }}>Nenhum bloqueado permanente encontrado.</td>
                   </tr>
                 )}
               </tbody>
