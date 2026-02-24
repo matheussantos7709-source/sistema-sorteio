@@ -255,3 +255,7 @@ tr.selected {
   overflow: auto;
   max-height: calc(100vh - 160px);
 }
+.modalBody {
+  max-height: 70vh;
+  overflow: auto;
+}
