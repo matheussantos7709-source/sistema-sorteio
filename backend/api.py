@@ -448,6 +448,38 @@ def promover(payload: PromoverIn):
 # HISTÓRICO
 # ---------------------------
 
+@app.get("/api/bloqueados-permanentes/count")
+def bloqueados_count():
+    conn = conectar()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM bloqueados_permanentes")
+        total = int(cur.fetchone()[0] or 0)
+        return {"ok": True, "total": total}
+    finally:
+        conn.close()
+
+
+@app.get("/api/bloqueados-permanentes")
+def listar_bloqueados(limit: int = 200):
+    limit = max(1, min(int(limit), 2000))  # evita abusar
+    conn = conectar()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT chave, nome, email, data_confirmacao
+            FROM bloqueados_permanentes
+            ORDER BY data_confirmacao DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = fetchall_dict(cur)
+        return {"ok": True, "items": rows, "limit": limit}
+    finally:
+        conn.close()
+
 @app.get("/api/historico")
 def historico():
     dados = listar_historico()
