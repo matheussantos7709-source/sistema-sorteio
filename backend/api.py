@@ -13,7 +13,6 @@ import os
 
 from openpyxl import Workbook
 
-# imports do seu projeto (monorepo)
 from backend.database import criar_tabela, conectar, registrar_vencedor
 from backend.services import (
     cadastrar_participante,
@@ -26,13 +25,12 @@ from backend.services import (
 
 app = FastAPI(title="Sistema de Sorteio API", version="1.0.0")
 
-# cria tabelas no start (Postgres)
 criar_tabela()
 print("DB: PostgreSQL via DATABASE_URL (Render)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # depois você pode restringir pro domínio do frontend
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,10 +41,6 @@ app.add_middleware(
 # ---------------------------
 
 def rows_to_dicts(cur, rows):
-    """
-    Converte fetchall() em lista de dicts usando cur.description
-    (funciona com pg8000 / postgres)
-    """
     cols = [c[0] for c in (cur.description or [])]
     return [dict(zip(cols, r)) for r in rows]
 
@@ -54,10 +48,6 @@ def fetchall_dict(cur):
     return rows_to_dicts(cur, cur.fetchall())
 
 def _mask_db_url(url: str) -> str:
-    """
-    Mascara senha do DATABASE_URL para não vazar em /dbinfo
-    Ex: postgresql://user:PASS@host/db -> postgresql://user:***@host/db
-    """
     if not url:
         return ""
     try:
@@ -75,13 +65,8 @@ def _mask_db_url(url: str) -> str:
         return "***"
 
 def _require_admin(x_admin_key: Optional[str]):
-    """
-    Protege endpoints administrativos.
-    Envie o header: X-ADMIN-KEY: <sua-chave>
-    """
     expected = (os.getenv("ADMIN_KEY") or "").strip()
     if not expected:
-        # Se você esquecer de configurar no Render, isso aqui protege de acidente
         raise HTTPException(status_code=500, detail="ADMIN_KEY não configurada no servidor.")
     if not x_admin_key or x_admin_key.strip() != expected:
         raise HTTPException(status_code=401, detail="Não autorizado (admin).")
@@ -121,10 +106,6 @@ def home():
 
 @app.get("/api/dbinfo")
 def dbinfo() -> Dict[str, Any]:
-    """
-    Endpoint pra você conferir SE está no Postgres e se o Render está com DATABASE_URL setada.
-    NÃO mostra senha.
-    """
     db_url = (os.getenv("DATABASE_URL") or "").strip()
     return {
         "ok": True,
@@ -140,16 +121,12 @@ def dbinfo() -> Dict[str, Any]:
 
 @app.get("/api/admin/migracao-status")
 def migracao_status(x_admin_key: Optional[str] = Header(None)):
-    """
-    Verifica se a coluna 'chave' e o índice unique já existem.
-    """
     _require_admin(x_admin_key)
 
     conn = conectar()
     try:
         cur = conn.cursor()
 
-        # coluna chave existe?
         cur.execute(
             """
             SELECT 1
@@ -160,7 +137,6 @@ def migracao_status(x_admin_key: Optional[str] = Header(None)):
         )
         has_col = cur.fetchone() is not None
 
-        # índice existe?
         cur.execute(
             """
             SELECT 1
@@ -171,7 +147,6 @@ def migracao_status(x_admin_key: Optional[str] = Header(None)):
         )
         has_index = cur.fetchone() is not None
 
-        # constraints UNIQUE de email/cpf ainda existem?
         cur.execute(
             """
             SELECT conname, pg_get_constraintdef(oid) AS def
@@ -194,25 +169,14 @@ def migracao_status(x_admin_key: Optional[str] = Header(None)):
 
 @app.post("/api/admin/migrar-schema")
 def migrar_schema(x_admin_key: Optional[str] = Header(None)):
-    """
-    Migra o schema do Postgres para a Opção B:
-    - adiciona coluna 'chave' se não existir
-    - remove UNIQUE de email/cpf (se existirem)
-    - preenche chave nos registros existentes
-    - cria índice unique na chave
-
-    Use 1 vez e depois você pode remover esse endpoint.
-    """
     _require_admin(x_admin_key)
 
     conn = conectar()
     try:
         cur = conn.cursor()
 
-        # 1) cria coluna chave se não existir
         cur.execute("ALTER TABLE participantes ADD COLUMN IF NOT EXISTS chave TEXT;")
 
-        # 2) remover UNIQUE de email (se existir)
         cur.execute(
             """
             SELECT conname
@@ -229,7 +193,6 @@ def migrar_schema(x_admin_key: Optional[str] = Header(None)):
             dropped_email = row[0]
             cur.execute(f'ALTER TABLE participantes DROP CONSTRAINT "{dropped_email}";')
 
-        # 3) remover UNIQUE de cpf (se existir)
         cur.execute(
             """
             SELECT conname
@@ -246,8 +209,6 @@ def migrar_schema(x_admin_key: Optional[str] = Header(None)):
             dropped_cpf = row[0]
             cur.execute(f'ALTER TABLE participantes DROP CONSTRAINT "{dropped_cpf}";')
 
-        # 4) preencher chave para registros antigos
-        # chave = lower(trim(nome)) + '|' + (email ou cpf ou whatsapp ou 'sem-contato')
         cur.execute(
             """
             UPDATE participantes
@@ -262,7 +223,6 @@ def migrar_schema(x_admin_key: Optional[str] = Header(None)):
         )
         updated_keys = cur.rowcount
 
-        # 5) criar índice unique na chave
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS participantes_chave_unique ON participantes(chave);"
         )
@@ -295,8 +255,7 @@ def listar_participantes():
     try:
         cur = conn.cursor()
         cur.execute("SELECT * FROM participantes ORDER BY id ASC")
-        data = fetchall_dict(cur)
-        return data
+        return fetchall_dict(cur)
     finally:
         conn.close()
 
@@ -389,18 +348,28 @@ def sortear(payload: SorteioIn):
     try:
         cur = conn.cursor()
 
+        # OPÇÃO B:
+        # - só INSCRITO e não bloqueado
+        # - NÃO pode estar em bloqueados_permanentes
         cur.execute(
             """
-            SELECT id, nome, email
-            FROM participantes
-            WHERE status='INSCRITO'
-              AND bloqueado=FALSE
+            SELECT p.id, p.nome, p.email, p.chave
+            FROM participantes p
+            WHERE p.status='INSCRITO'
+              AND p.bloqueado=FALSE
+              AND NOT EXISTS (
+                SELECT 1 FROM bloqueados_permanentes b
+                WHERE b.chave = p.chave
+              )
             """
         )
         participantes = fetchall_dict(cur)
 
         if len(participantes) < (vagas + suplentes_qtd):
-            raise HTTPException(status_code=400, detail="Participantes insuficientes.")
+            raise HTTPException(
+                status_code=400,
+                detail="Participantes insuficientes (considerando bloqueio permanente)."
+            )
 
         random.shuffle(participantes)
 
@@ -408,13 +377,15 @@ def sortear(payload: SorteioIn):
         suplentes = participantes[vagas : vagas + suplentes_qtd]
         agora = datetime.now()
 
-        # vencedores
+        # vencedores (bloqueio permanente já aqui)
         for idx, p in enumerate(vencedores, start=1):
             pid = p["id"]
             nome = p.get("nome") or ""
             email = p.get("email") or ""
+            chave = p.get("chave") or ""
 
             registrar_vencedor(pid, nome, email, conn=conn)
+
             cur.execute(
                 """
                 UPDATE participantes
@@ -428,7 +399,17 @@ def sortear(payload: SorteioIn):
                 (agora, idx, pid),
             )
 
-        # suplentes
+            if chave:
+                cur.execute(
+                    """
+                    INSERT INTO bloqueados_permanentes (chave, nome, email, data_confirmacao)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (chave) DO NOTHING
+                    """,
+                    (chave, nome, email),
+                )
+
+        # suplentes (não bloqueia permanente)
         for idx, s in enumerate(suplentes, start=vagas + 1):
             pid = s["id"]
             cur.execute(
@@ -444,7 +425,7 @@ def sortear(payload: SorteioIn):
             )
 
         conn.commit()
-        return {"ok": True, "msg": "Sorteio realizado."}
+        return {"ok": True, "msg": "Sorteio realizado (Opção B: bloqueio permanente ao selecionar)."}
     finally:
         conn.close()
 
@@ -489,7 +470,6 @@ async def importar_csv(file: UploadFile = File(...)):
 
     content = await file.read()
 
-    # tenta decodificar com fallback
     text = None
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
@@ -548,7 +528,6 @@ async def importar_excel(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=result.get("msg", "Planilha inválida."))
 
     erros_list = result.get("erros", []) or []
-    importados = int(result.get("importados", 0) or 0)
 
     return {
         "ok": True,
@@ -557,7 +536,7 @@ async def importar_excel(file: UploadFile = File(...)):
         "ignorados": int(result.get("ignorados", 0) or 0),
         "erros": erros_list,
         "erros_qtd": len(erros_list),
-}
+    }
 
 
 # ---------------------------
