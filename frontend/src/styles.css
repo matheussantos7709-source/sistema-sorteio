@@ -241,3 +241,17 @@ tr.selected {
   color:#9ca3af;
   font-size: 12px;
 }
+
+/* FIX: modal com rolagem (histórico e bloqueados) */
+.modal {
+  width: min(760px, 100%);
+  max-height: calc(100vh - 60px);
+  display: flex;
+  flex-direction: column;
+}
+
+.modalBody {
+  padding: 12px;
+  overflow: auto;
+  max-height: calc(100vh - 160px);
+}
