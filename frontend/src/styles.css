@@ -110,6 +110,7 @@ input::placeholder { color: rgba(226,232,240,0.45); }
   display:flex;
   gap: 10px;
   margin-top: 10px;
+  flex-wrap: wrap;
 }
 
 button {
@@ -203,7 +204,6 @@ tr.selected {
   align-items:center;
   justify-content:center;
   padding: 18px;
-  z-index: 9999; /* garante ficar acima */
 }
 
 .modal {
@@ -212,11 +212,6 @@ tr.selected {
   border: 1px solid rgba(255,255,255,0.12);
   border-radius: 14px;
   box-shadow: 0 15px 45px rgba(0,0,0,0.45);
-
-  /* NOVO: limita altura e permite body rolar */
-  max-height: 90vh;
-  display: flex;
-  flex-direction: column;
 }
 
 .modalHeader {
@@ -226,36 +221,17 @@ tr.selected {
   display:flex;
   justify-content:space-between;
   align-items:center;
-  flex: 0 0 auto; /* header não encolhe */
 }
 
-/* NOVO: área rolável */
 .modalBody {
   padding: 12px;
-  flex: 1 1 auto;
-  overflow-y: auto;
-  overflow-x: auto;
+
+  /* ✅ rolagem dentro do modal */
+  max-height: 70vh;
+  overflow: auto;
 }
 
 .small {
   color:#9ca3af;
   font-size: 12px;
-}
-
-/* FIX: modal com rolagem (histórico e bloqueados) */
-.modal {
-  width: min(760px, 100%);
-  max-height: calc(100vh - 60px);
-  display: flex;
-  flex-direction: column;
-}
-
-.modalBody {
-  padding: 12px;
-  overflow: auto;
-  max-height: calc(100vh - 160px);
-}
-.modalBody {
-  max-height: 70vh;
-  overflow: auto;
 }
