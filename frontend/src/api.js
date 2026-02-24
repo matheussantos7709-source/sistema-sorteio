@@ -70,14 +70,14 @@ export const api = {
   apagarHistorico: (resetId) =>
     jsonReq(`/api/historico?reset_id=${resetId}`, { method: "DELETE" }),
 
-  // BLOQUEADOS PERMANENTES (NOVO)
-  bloqueadosCount: () => jsonReq("/api/bloqueados-permanentes/count"),
-  listarBloqueados: (limit = 500) => jsonReq(`/api/bloqueados-permanentes?limit=${limit}`),
-
   // EXPORTAÇÃO
   exportarParticipantes: () => fileReq("/api/exportar-participantes"),
   exportarResultados: () => fileReq("/api/exportar-resultados"),
 
-  // (Opcional) expor BASE pra debug
+  // BLOQUEADOS PERMANENTES
+  bloqueadosCount: () => jsonReq("/api/bloqueados-permanentes/count"),
+  bloqueadosListar: (limit = 200) => jsonReq(`/api/bloqueados-permanentes?limit=${limit}`),
+
+  // debug
   __BASE__: BASE,
 };
