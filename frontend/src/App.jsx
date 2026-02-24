@@ -48,7 +48,6 @@ async function downloadBlob(blob, filenameFallback) {
 
 export default function App() {
   const [tab, setTab] = useState("cadastro"); // cadastro | importacao | sorteio
-
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState(null); // {type:'ok'|'err', msg:string}
 
@@ -69,10 +68,11 @@ export default function App() {
   const [historico, setHistorico] = useState([]);
   const [resetId, setResetId] = useState(true);
 
-  // bloqueados permanentes (NOVO)
-  const [bloqOpen, setBloqOpen] = useState(false);
+  // bloqueados permanentes
+  const [blockOpen, setBlockOpen] = useState(false);
   const [bloqueados, setBloqueados] = useState([]);
-  const [bloqueadosTotal, setBloqueadosTotal] = useState(null);
+  const [bloqTotal, setBloqTotal] = useState(0);
+  const [bloqLimit, setBloqLimit] = useState(200);
 
   // forms
   const [cad, setCad] = useState({
@@ -114,19 +114,8 @@ export default function App() {
     }
   }
 
-  async function carregarBloqueadosCount() {
-    try {
-      const r = await api.bloqueadosCount();
-      setBloqueadosTotal(Number(r?.total ?? 0));
-    } catch (e) {
-      // não quebra o site se o endpoint ainda não existir
-      setBloqueadosTotal(null);
-    }
-  }
-
   useEffect(() => {
     carregarParticipantes();
-    carregarBloqueadosCount();
   }, []);
 
   const participantesFiltrados = useMemo(() => {
@@ -293,13 +282,8 @@ export default function App() {
     setLoading(true);
     try {
       const r = await api.confirmar({ email });
-      if (r.ok) {
-        showOk("Confirmado com sucesso!");
-        // se confirmou, provavelmente aumentou a lista de bloqueados
-        carregarBloqueadosCount();
-      } else {
-        showErr(r.msg || "Não encontrado.");
-      }
+      if (r.ok) showOk("Confirmado com sucesso!");
+      else showErr(r.msg || "Não encontrado.");
       setConfirmEmail("");
       await carregarParticipantes();
     } catch (e) {
@@ -356,20 +340,33 @@ export default function App() {
     }
   }
 
-  // -------- BLOQUEADOS (NOVO) --------
+  // -------- BLOQUEADOS --------
   async function abrirBloqueados() {
     setLoading(true);
     try {
-      const r = await api.listarBloqueados(800);
-      const items = Array.isArray(r?.items) ? r.items : [];
-      setBloqueados(items);
-      setBloqOpen(true);
+      const c = await api.bloqueadosCount();
+      setBloqTotal(Number(c?.total || 0));
 
-      // garante contador atualizado
-      if (typeof r?.items?.length === "number") {
-        // não é o total real, mas ajuda quando o count falhar
-      }
-      carregarBloqueadosCount();
+      const r = await api.bloqueadosListar(Number(bloqLimit || 200));
+      setBloqueados(Array.isArray(r?.items) ? r.items : []);
+
+      setBlockOpen(true);
+    } catch (e) {
+      showErr(e);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function atualizarBloqueados() {
+    setLoading(true);
+    try {
+      const c = await api.bloqueadosCount();
+      setBloqTotal(Number(c?.total || 0));
+
+      const r = await api.bloqueadosListar(Number(bloqLimit || 200));
+      setBloqueados(Array.isArray(r?.items) ? r.items : []);
+      showOk("Bloqueados atualizados!");
     } catch (e) {
       showErr(e);
     } finally {
@@ -385,8 +382,6 @@ export default function App() {
       const r = await api.importarExcel(file);
       showOk(`Importação concluída! Importados: ${r.importados ?? 0} | Ignorados: ${r.ignorados ?? 0}`);
       await carregarParticipantes();
-      // após importar, pode ter ignorados por bloqueio -> atualiza contador
-      carregarBloqueadosCount();
     } catch (e) {
       showErr(e);
     } finally {
@@ -402,7 +397,6 @@ export default function App() {
       const r = await api.importarCsv(file);
       showOk(`Importação CSV ok! Importados: ${r.importados ?? 0} | Ignorados: ${r.ignorados ?? 0}`);
       await carregarParticipantes();
-      carregarBloqueadosCount();
     } catch (e) {
       showErr(e);
     } finally {
@@ -444,24 +438,13 @@ export default function App() {
           <div className="title">Sistema de Sorteio</div>
           <div className="sub">
             Participantes (tempo real) — <b>{participantes.length}</b> no total
-            {"  "}•{"  "}
-            Bloqueados permanentes —{" "}
-            <b>{bloqueadosTotal === null ? "?" : bloqueadosTotal}</b>
           </div>
         </div>
 
         <div style={{ display: "flex", gap: 10 }}>
-          <button
-            onClick={async () => {
-              await carregarParticipantes();
-              await carregarBloqueadosCount();
-            }}
-            className="primary"
-            disabled={loading}
-          >
+          <button onClick={carregarParticipantes} className="primary" disabled={loading}>
             {loading ? "Carregando..." : "Atualizar"}
           </button>
-
           <button onClick={abrirHistorico} disabled={loading}>Ver Histórico</button>
           <button onClick={abrirBloqueados} disabled={loading}>Ver Bloqueados</button>
         </div>
@@ -525,7 +508,7 @@ export default function App() {
                 </div>
 
                 <div className="small" style={{ marginTop: 10 }}>
-                  Dica: o cadastro atualiza se já existir mesmo e-mail ou CPF.
+                  Dica: o cadastro atualiza se já existir mesma chave.
                 </div>
               </>
             )}
@@ -535,7 +518,7 @@ export default function App() {
                 <div className="cardHeader" style={{ padding: 0, marginBottom: 10 }}>Importação / Exportação</div>
 
                 <div className="small">
-                  Importar envia o arquivo pro backend e grava no banco. Exportar baixa um .xlsx gerado pela API.
+                  Importar envia o arquivo pro backend e grava no Postgres. Exportar baixa um .xlsx gerado pela API.
                 </div>
 
                 <div style={{ height: 10 }} />
@@ -811,33 +794,40 @@ export default function App() {
         </Modal>
       )}
 
-      {/* MODAL BLOQUEADOS (NOVO) */}
-      {bloqOpen && (
-        <Modal title="Bloqueados permanentes" onClose={() => setBloqOpen(false)}>
+      {/* MODAL BLOQUEADOS PERMANENTES */}
+      {blockOpen && (
+        <Modal title="Bloqueados Permanentes" onClose={() => setBlockOpen(false)}>
           <div className="actionsRow" style={{ justifyContent: "space-between" }}>
             <div className="small">
-              Mostrando: <b>{bloqueados.length}</b>
-              {bloqueadosTotal !== null ? (
-                <>
-                  {" "}• Total: <b>{bloqueadosTotal}</b>
-                </>
-              ) : null}
+              Total no banco: <b>{bloqTotal}</b> | Mostrando: <b>{bloqueados.length}</b>
             </div>
-            <button onClick={abrirBloqueados} disabled={loading}>
-              Atualizar lista
-            </button>
+
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <div className="field" style={{ margin: 0 }}>
+                <label>Limite</label>
+                <input
+                  value={String(bloqLimit)}
+                  onChange={(e) => setBloqLimit(e.target.value)}
+                  style={{ width: 110 }}
+                />
+              </div>
+
+              <button className="primary" onClick={atualizarBloqueados} disabled={loading}>
+                Atualizar lista
+              </button>
+            </div>
           </div>
 
           <div style={{ height: 10 }} />
 
           <div className="tableWrap">
-            <table>
+            <table style={{ minWidth: 880 }}>
               <thead>
                 <tr>
-                  <th style={{ width: 180 }}>Data</th>
+                  <th style={{ width: 220 }}>Data confirmação</th>
                   <th>Nome</th>
                   <th>E-mail</th>
-                  <th style={{ width: 260 }}>Chave</th>
+                  <th style={{ width: 320 }}>Chave</th>
                 </tr>
               </thead>
               <tbody>
@@ -846,18 +836,21 @@ export default function App() {
                     <td>{b.data_confirmacao || "-"}</td>
                     <td>{b.nome || "-"}</td>
                     <td>{b.email || "-"}</td>
-                    <td style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace", fontSize: 12 }}>
-                      {b.chave || "-"}
-                    </td>
+                    <td style={{ opacity: 0.9 }}>{b.chave || "-"}</td>
                   </tr>
                 ))}
+
                 {bloqueados.length === 0 && (
                   <tr>
-                    <td colSpan={4} style={{ color: "#9ca3af" }}>Nenhum bloqueado permanente encontrado.</td>
+                    <td colSpan={4} style={{ color: "#9ca3af" }}>Sem bloqueados permanentes.</td>
                   </tr>
                 )}
               </tbody>
             </table>
+          </div>
+
+          <div className="small" style={{ marginTop: 10 }}>
+            Observação: só entra aqui quem foi <b>CONFIRMADO</b>. Selecionado é bloqueio <b>temporário</b>.
           </div>
         </Modal>
       )}
