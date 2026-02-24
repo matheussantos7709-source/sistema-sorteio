@@ -25,6 +25,7 @@ from backend.services import (
 
 app = FastAPI(title="Sistema de Sorteio API", version="1.0.0")
 
+# cria tabelas no start (Postgres)
 criar_tabela()
 print("DB: PostgreSQL via DATABASE_URL (Render)")
 
@@ -71,6 +72,13 @@ def _require_admin(x_admin_key: Optional[str]):
     if not x_admin_key or x_admin_key.strip() != expected:
         raise HTTPException(status_code=401, detail="Não autorizado (admin).")
 
+# para CSV (se quiser manter bloqueados permanentes também no csv)
+def _csv_get(row: dict, *keys: str) -> str:
+    for k in keys:
+        v = row.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
 
 # ---------------------------
 # MODELOS
@@ -95,7 +103,6 @@ class ConfirmarIn(BaseModel):
 class PromoverIn(BaseModel):
     prazo_horas: int = 48
 
-
 # ---------------------------
 # ROTAS BÁSICAS
 # ---------------------------
@@ -107,13 +114,14 @@ def home():
 @app.get("/api/dbinfo")
 def dbinfo() -> Dict[str, Any]:
     db_url = (os.getenv("DATABASE_URL") or "").strip()
+    admin_set = bool((os.getenv("ADMIN_KEY") or "").strip())
     return {
         "ok": True,
-        "assinatura": "POSTGRES_V2_2026-02-12",
+        "assinatura": "POSTGRES_BLOQUEIO_TEMP_E_PERM_2026-02-24",
         "database_url_set": bool(db_url),
         "database_url_masked": _mask_db_url(db_url) if db_url else "",
+        "admin_key_set": admin_set,
     }
-
 
 # ---------------------------
 # ADMIN - MIGRAÇÃO (OPÇÃO B)
@@ -127,6 +135,7 @@ def migracao_status(x_admin_key: Optional[str] = Header(None)):
     try:
         cur = conn.cursor()
 
+        # coluna chave existe?
         cur.execute(
             """
             SELECT 1
@@ -137,31 +146,33 @@ def migracao_status(x_admin_key: Optional[str] = Header(None)):
         )
         has_col = cur.fetchone() is not None
 
+        # índice existe? (no seu database.py o nome é participantes_chave_uidx)
         cur.execute(
             """
             SELECT 1
             FROM pg_indexes
-            WHERE tablename='participantes' AND indexname='participantes_chave_unique'
+            WHERE tablename='participantes' AND indexname IN ('participantes_chave_uidx','participantes_chave_unique')
             LIMIT 1
             """
         )
         has_index = cur.fetchone() is not None
 
+        # tabela bloqueados existe?
         cur.execute(
             """
-            SELECT conname, pg_get_constraintdef(oid) AS def
-            FROM pg_constraint
-            WHERE conrelid = 'participantes'::regclass
-              AND contype='u'
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_name='bloqueados_permanentes'
+            LIMIT 1
             """
         )
-        uniques = [{"name": r[0], "def": r[1]} for r in cur.fetchall()]
+        has_block_table = cur.fetchone() is not None
 
         return {
             "ok": True,
             "coluna_chave_existe": has_col,
             "indice_chave_existe": has_index,
-            "unique_constraints": uniques,
+            "tabela_bloqueados_existe": has_block_table,
         }
     finally:
         conn.close()
@@ -169,6 +180,10 @@ def migracao_status(x_admin_key: Optional[str] = Header(None)):
 
 @app.post("/api/admin/migrar-schema")
 def migrar_schema(x_admin_key: Optional[str] = Header(None)):
+    """
+    Mantido por compatibilidade.
+    OBS: no seu database.py a tabela já cria chave e index.
+    """
     _require_admin(x_admin_key)
 
     conn = conectar()
@@ -176,39 +191,19 @@ def migrar_schema(x_admin_key: Optional[str] = Header(None)):
         cur = conn.cursor()
 
         cur.execute("ALTER TABLE participantes ADD COLUMN IF NOT EXISTS chave TEXT;")
-
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS participantes_chave_uidx ON participantes(chave);")
         cur.execute(
             """
-            SELECT conname
-            FROM pg_constraint
-            WHERE conrelid = 'participantes'::regclass
-              AND contype = 'u'
-              AND pg_get_constraintdef(oid) ILIKE '%(email)%'
-            LIMIT 1
+            CREATE TABLE IF NOT EXISTS bloqueados_permanentes (
+                chave TEXT PRIMARY KEY,
+                nome TEXT,
+                email TEXT,
+                data_confirmacao TIMESTAMP DEFAULT NOW()
+            )
             """
         )
-        row = cur.fetchone()
-        dropped_email = None
-        if row and row[0]:
-            dropped_email = row[0]
-            cur.execute(f'ALTER TABLE participantes DROP CONSTRAINT "{dropped_email}";')
 
-        cur.execute(
-            """
-            SELECT conname
-            FROM pg_constraint
-            WHERE conrelid = 'participantes'::regclass
-              AND contype = 'u'
-              AND pg_get_constraintdef(oid) ILIKE '%(cpf)%'
-            LIMIT 1
-            """
-        )
-        row = cur.fetchone()
-        dropped_cpf = None
-        if row and row[0]:
-            dropped_cpf = row[0]
-            cur.execute(f'ALTER TABLE participantes DROP CONSTRAINT "{dropped_cpf}";')
-
+        # preencher chave onde estiver vazia (versão simples)
         cur.execute(
             """
             UPDATE participantes
@@ -217,33 +212,20 @@ def migrar_schema(x_admin_key: Optional[str] = Header(None)):
                 COALESCE(NULLIF(LOWER(TRIM(email)), ''),
                          NULLIF(LOWER(TRIM(cpf)), ''),
                          NULLIF(LOWER(TRIM(whatsapp)), ''),
-                         'sem-contato')
+                         'sem_contato')
             WHERE chave IS NULL OR chave = '';
             """
         )
         updated_keys = cur.rowcount
 
-        cur.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS participantes_chave_unique ON participantes(chave);"
-        )
-
         conn.commit()
-
-        return {
-            "ok": True,
-            "msg": "Migração executada com sucesso.",
-            "email_unique_removido": dropped_email or False,
-            "cpf_unique_removido": dropped_cpf or False,
-            "chaves_preenchidas": updated_keys,
-            "indice_criado": True,
-        }
+        return {"ok": True, "msg": "Migração executada.", "chaves_preenchidas": updated_keys}
 
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Erro na migração: {type(e).__name__}: {e}")
     finally:
         conn.close()
-
 
 # ---------------------------
 # PARTICIPANTES
@@ -279,9 +261,14 @@ def criar_ou_atualizar_participante(p: ParticipanteIn):
 
 @app.delete("/api/participantes")
 def deletar_todos_participantes(
-    apagar_historico: bool = Query(False),
+    apagar_historico: bool = Query(False),  # opção extra se você quiser apagar também
     reset_ids: bool = Query(True),
 ):
+    """
+    OPÇÃO 2 (a sua): por padrão APAGA SÓ participantes.
+    - NÃO apaga bloqueados_permanentes
+    - histórico só apaga se apagar_historico=True
+    """
     conn = conectar()
     try:
         cur = conn.cursor()
@@ -307,7 +294,7 @@ def deletar_todos_participantes(
 
         return {
             "ok": True,
-            "msg": "Limpeza concluída.",
+            "msg": "Limpeza concluída (participantes apagados; bloqueio permanente preservado).",
             "participantes_removidos": total_part,
             "historico_removidos": total_hist if apagar_historico else 0,
             "reset_ids": reset_ids,
@@ -329,7 +316,6 @@ def deletar_participante(pid: int):
     finally:
         conn.close()
 
-
 # ---------------------------
 # SORTEIO / CONFIRMAÇÃO / PROMOÇÃO
 # ---------------------------
@@ -348,9 +334,9 @@ def sortear(payload: SorteioIn):
     try:
         cur = conn.cursor()
 
-        # OPÇÃO B:
+        # OPÇÃO B + sua regra:
         # - só INSCRITO e não bloqueado
-        # - NÃO pode estar em bloqueados_permanentes
+        # - NÃO pode estar em bloqueados_permanentes (bloqueio permanente só no CONFIRMAR)
         cur.execute(
             """
             SELECT p.id, p.nome, p.email, p.chave
@@ -377,12 +363,11 @@ def sortear(payload: SorteioIn):
         suplentes = participantes[vagas : vagas + suplentes_qtd]
         agora = datetime.now()
 
-        # vencedores (bloqueio permanente já aqui)
+        # vencedores => bloqueio TEMPORÁRIO (bloqueado=TRUE) + status SELECIONADO
         for idx, p in enumerate(vencedores, start=1):
             pid = p["id"]
             nome = p.get("nome") or ""
             email = p.get("email") or ""
-            chave = p.get("chave") or ""
 
             registrar_vencedor(pid, nome, email, conn=conn)
 
@@ -399,17 +384,7 @@ def sortear(payload: SorteioIn):
                 (agora, idx, pid),
             )
 
-            if chave:
-                cur.execute(
-                    """
-                    INSERT INTO bloqueados_permanentes (chave, nome, email, data_confirmacao)
-                    VALUES (%s, %s, %s, NOW())
-                    ON CONFLICT (chave) DO NOTHING
-                    """,
-                    (chave, nome, email),
-                )
-
-        # suplentes (não bloqueia permanente)
+        # suplentes
         for idx, s in enumerate(suplentes, start=vagas + 1):
             pid = s["id"]
             cur.execute(
@@ -425,7 +400,7 @@ def sortear(payload: SorteioIn):
             )
 
         conn.commit()
-        return {"ok": True, "msg": "Sorteio realizado (Opção B: bloqueio permanente ao selecionar)."}
+        return {"ok": True, "msg": "Sorteio realizado (bloqueio temporário ao selecionar; permanente só ao confirmar)."}
     finally:
         conn.close()
 
@@ -434,8 +409,16 @@ def confirmar(payload: ConfirmarIn):
     email = (payload.email or "").strip()
     if not email:
         raise HTTPException(status_code=400, detail="Email é obrigatório.")
+
     alterados = confirmar_presenca_por_email(email)
-    return {"ok": alterados > 0, "alterados": alterados}
+
+    if alterados > 0:
+        return {
+            "ok": True,
+            "alterados": alterados,
+            "msg": "Confirmado e bloqueado permanentemente (não volta em sorteios futuros).",
+        }
+    return {"ok": False, "alterados": 0, "msg": "Nenhum SELECIONADO encontrado com esse e-mail."}
 
 @app.post("/api/promover")
 def promover(payload: PromoverIn):
@@ -443,9 +426,8 @@ def promover(payload: PromoverIn):
     ok, msg = promover_suplente_se_expirou(prazo)
     return {"ok": ok, "msg": msg}
 
-
 # ---------------------------
-# HISTÓRICO
+# BLOQUEADOS PERMANENTES (para mostrar no front)
 # ---------------------------
 
 @app.get("/api/bloqueados-permanentes/count")
@@ -459,10 +441,9 @@ def bloqueados_count():
     finally:
         conn.close()
 
-
 @app.get("/api/bloqueados-permanentes")
 def listar_bloqueados(limit: int = 200):
-    limit = max(1, min(int(limit), 2000))  # evita abusar
+    limit = max(1, min(int(limit), 2000))
     conn = conectar()
     try:
         cur = conn.cursor()
@@ -480,6 +461,10 @@ def listar_bloqueados(limit: int = 200):
     finally:
         conn.close()
 
+# ---------------------------
+# HISTÓRICO
+# ---------------------------
+
 @app.get("/api/historico")
 def historico():
     dados = listar_historico()
@@ -489,7 +474,6 @@ def historico():
 def apagar_historico(reset_id: bool = True):
     apagados = limpar_historico(reset_id=reset_id)
     return {"ok": True, "apagados": apagados}
-
 
 # ---------------------------
 # IMPORTAÇÃO
@@ -520,21 +504,26 @@ async def importar_csv(file: UploadFile = File(...)):
     ignorados = 0
     erros = 0
 
+    # IMPORTANTE:
+    # seu bloqueio permanente no CSV é feito dentro do services no XLSX,
+    # mas no CSV a gente não tem isso lá. Então deixo o CSV simples:
+    # - cadastra e o services faz UPSERT por chave
+    # - se quiser bloquear permanente também no CSV, a gente mexe no services depois.
     for row in reader:
         try:
-            nome = (row.get("nome") or "").strip()
+            nome = _csv_get(row, "nome", "Nome", "NOME")
             if not nome:
                 ignorados += 1
                 continue
 
             cadastrar_participante(
                 nome,
-                (row.get("email") or "").strip(),
-                (row.get("cpf") or "").strip(),
-                (row.get("whatsapp") or "").strip(),
-                (row.get("curso") or "").strip(),
-                (row.get("perfil") or "").strip(),
-                (row.get("semestre") or "").strip(),
+                _csv_get(row, "email", "e-mail", "Email", "E-mail"),
+                _csv_get(row, "cpf", "CPF"),
+                _csv_get(row, "whatsapp", "WhatsApp", "telefone", "celular"),
+                _csv_get(row, "curso", "Curso"),
+                _csv_get(row, "perfil", "Perfil"),
+                _csv_get(row, "semestre", "Semestre"),
             )
             importados += 1
         except Exception:
@@ -569,7 +558,6 @@ async def importar_excel(file: UploadFile = File(...)):
         "erros": erros_list,
         "erros_qtd": len(erros_list),
     }
-
 
 # ---------------------------
 # EXPORTAÇÃO
