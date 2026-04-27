@@ -25,9 +25,22 @@ from backend.services import (
 
 app = FastAPI(title="Sistema de Sorteio API", version="1.0.0")
 
-# cria tabelas no start (Postgres)
-criar_tabela()
-print("DB: PostgreSQL via DATABASE_URL (Render)")
+
+@app.on_event("startup")
+def startup():
+    """
+    Tenta preparar o banco quando a API inicia.
+
+    Importante:
+    - Antes, o app chamava criar_tabela() direto no carregamento do arquivo.
+    - Se o PostgreSQL/DATABASE_URL estivesse ausente ou quebrado, o Render derrubava o deploy.
+    - Agora o erro aparece no log, mas a API consegue subir para você testar / e /api/dbinfo.
+    """
+    try:
+        criar_tabela()
+        print("DB: PostgreSQL conectado e tabelas verificadas.")
+    except Exception as e:
+        print(f"AVISO: não foi possível conectar/preparar o banco: {type(e).__name__}: {e}")
 
 app.add_middleware(
     CORSMiddleware,
