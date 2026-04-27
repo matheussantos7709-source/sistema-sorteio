@@ -9,7 +9,7 @@ def _parse_database_url(url: str):
     """
     Aceita:
       postgres://user:pass@host:port/db?sslmode=require
-      postgresql://...
+      postgresql://user:pass@host:port/db?sslmode=require
     """
     if not url:
         raise RuntimeError("DATABASE_URL não definida.")
@@ -26,6 +26,11 @@ def _parse_database_url(url: str):
     user = u.username or ""
     password = u.password or ""
     database = (u.path or "").lstrip("/")
+
+    if not host or not user or not database:
+        raise RuntimeError(
+            "DATABASE_URL inválida. Confira se ela tem host, usuário e nome do banco."
+        )
 
     # sslmode: require/disable/prefer/verify-full/verify-ca...
     sslmode = (qs.get("sslmode", ["require"])[0] or "require").lower()
@@ -51,6 +56,10 @@ def _make_ssl_context(sslmode: str):
 
 def conectar():
     database_url = (os.getenv("DATABASE_URL") or "").strip()
+
+    if not database_url:
+        raise RuntimeError("DATABASE_URL não configurada no Render.")
+
     host, port, user, password, database, sslmode = _parse_database_url(database_url)
 
     ssl_ctx = _make_ssl_context(sslmode)
